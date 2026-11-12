@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.2.0
+// @version      2.2.1
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -33,7 +33,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.2.0'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.2.1'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -177,6 +177,17 @@ function fmt(n) {
     } catch (e) { return G.cookiesPs || 0; }
   }
 
+  // 測定専用の物差し（v2.2.1で統一）: CalculateGains() がその場で更新する値だけを読む。
+  // unbuffedCps はメインループ側の更新で、同期的な再計算の中では追随しないことがある（v2.1.1の診断で判明）。
+  // 効果のシミュレーションと購入後検証は、必ずこの同じ物差しで測ること（物差しの混在が異常値の原因だった）。
+  function readProduction() {
+    var G = W.Game;
+    var cps = 0, click = 0;
+    try { cps = (typeof G.cookiesPsRaw === 'number' && G.cookiesPsRaw > 0) ? G.cookiesPsRaw : baseCps(); } catch (e) { cps = 0; }
+    try { click = mouseCps(); } catch (e2) { click = 0; }
+    return { cps: cps, click: click };
+  }
+
   function unitCpsOf(obj) {
     // 建物1軒あたりの増産量。再計算済みの storedCps（建物レベル補正込み）を優先する
     try {
@@ -263,7 +274,8 @@ function fmt(n) {
     var dcps = 0, dclick = 0;
     try {
       var G = W.Game;
-      var cps0 = baseCps(), click0 = mouseCps();
+      var prod0 = readProduction();
+      var cps0 = prod0.cps, click0 = prod0.click;
       var bank0 = G.cookies, ach0 = ach, uOwned0 = uOwned;
       var origBought = up.bought;
       var highest0 = (typeof G.cookiesPsRawHighest === 'number') ? G.cookiesPsRawHighest : null;
@@ -271,8 +283,9 @@ function fmt(n) {
       up.bought = 1;
       try {
         G.CalculateGains();
-        dcps = Math.max(0, baseCps() - cps0);
-        dclick = Math.max(0, mouseCps() - click0);
+        var prod1 = readProduction();
+        dcps = Math.max(0, prod1.cps - cps0);
+        dclick = Math.max(0, prod1.click - click0);
       } catch (e1) { failed = true; }
       try {
         up.bought = origBought;
@@ -283,9 +296,10 @@ function fmt(n) {
       if (!failed) {
         try {
           var tol = Math.max(1, cps0 * 0.001);
+          var prodR = readProduction();
           if (up.bought !== origBought ||
-              Math.abs(baseCps() - cps0) > tol ||
-              Math.abs(mouseCps() - click0) > Math.max(0.01, click0 * 0.001) ||
+              Math.abs(prodR.cps - cps0) > tol ||
+              Math.abs(prodR.click - click0) > Math.max(0.01, click0 * 0.001) ||
               (highest0 !== null && G.cookiesPsRawHighest !== highest0) ||
               G.cookies !== bank0 || achievementCount() !== ach0 ||
               (G.UpgradesOwned || 0) !== uOwned0) {
@@ -345,6 +359,8 @@ function fmt(n) {
       var sum0 = storedSum();
       var failed = false, wild = false;
       obj.amount = amt0 + 1;
+      // 派生カウンタ（所有建物数）も、そのフェーズの値に合わせてから再計算する（Cursor のボーナス計算が参照するため）
+      try { G.BuildingsOwned = bOwned0 + 1; } catch (e8) { /* ignore */ }
       try {
         G.CalculateGains();
         gain = Math.max(0, storedSum() - sum0);
@@ -353,9 +369,10 @@ function fmt(n) {
         try { unit0 = unitCpsOf(obj) || 0; } catch (e6) { unit0 = 0; }
         if (gain > Math.max(sum0 * 0.25, unit0 * 30)) wild = true;
       } catch (e1) { failed = true; }
-      try { obj.amount = amt0; G.CalculateGains(); } catch (e2) { failed = true; }
+      // 復元は「軒数と所有建物数を先に戻してから」再計算する。順序が逆だと、Cursor の
+      // Thousand fingers 系ボーナスがずれた値で計算され、stored 値が元に戻らない（v2.2.1の修正）
+      try { obj.amount = amt0; G.BuildingsOwned = bOwned0; G.CalculateGains(); } catch (e2) { failed = true; }
       if (highest0 !== null) { try { G.cookiesPsRawHighest = highest0; } catch (e3) { /* ignore */ } }
-      // 派生カウンタ（所有建物数）は再計算だけでは元に戻らないことがあるため、手で元の値へ戻す
       try { if ((G.BuildingsOwned || 0) !== bOwned0) G.BuildingsOwned = bOwned0; } catch (e5) { /* ignore */ }
       // どの項目が一致しなかったかを記録する（原因の切り分け用に報告へ含める）
       var badFields = [];
@@ -546,10 +563,11 @@ function fmt(n) {
   function doBuy(cand, quiet) {
     var G = W.Game;
     var bankBefore = G.cookies;
-    var cpsBefore = 0;
-    try { cpsBefore = baseCps(); } catch (e) { /* ignore */ }
-    var clickBefore = 0;
-    try { clickBefore = mouseCps(); } catch (e) { /* ignore */ }
+    // 購入後検証の物差しは readProduction() に統一する（シミュレーションと同じ読み方）
+    var prodBefore = null;
+    try { prodBefore = readProduction(); } catch (e) { /* ignore */ }
+    var cpsBefore = prodBefore ? prodBefore.cps : 0;
+    var clickBefore = prodBefore ? prodBefore.click : 0;
     try {
       if (cand.kind === 'building') {
         var before = cand.ref.amount;
@@ -655,9 +673,13 @@ function fmt(n) {
       var pv = state.pendingVerify;
       // 全体系の gain にはクリック値の増分（実測速度で換算）が含まれるため、検証も同じ物差しで照合する
       var measured = null;
+      var measParts = null;
       try {
-        measured = (baseCps() - pv.cpsBefore) +
-          Math.max(0, mouseCps() - (pv.clickBefore || 0)) * measuredClickRate();
+        var prodNow = readProduction();
+        var dCpsPart = prodNow.cps - pv.cpsBefore;
+        var dClickPart = Math.max(0, prodNow.click - (pv.clickBefore || 0)) * measuredClickRate();
+        measured = dCpsPart + dClickPart;
+        measParts = { dCps: dCpsPart, dClick: dClickPart };
       } catch (e) { measured = null; }
       // 検証の計算が最後まで済んでから記録を消す（途中で例外が出たら未検証として停止する）
       state.pendingVerify = null;
@@ -667,6 +689,8 @@ function fmt(n) {
       } else if (pv.gain > 0) {
         // 購入と検証のあいだにゴールデンクッキー等の効果が始まった/終わった場合は、測定が信用できないため判定しない
         var buffChanged = pv.buffs != null && buffSignature() !== pv.buffs;
+        // クリック系バフ（Click frenzy 等）が購入時・検証時のどちらかに掛かっていたら、クリック値の実測が大きく振れるため判定しない
+        if (/click/i.test(pv.buffs || '') || /click/i.test(buffSignature() || '')) buffChanged = true;
         var tooLow = !buffChanged && measured < pv.gain * 0.5;
         // 増えすぎ側は、予測に入らない相乗効果などで普通に起こるため、本当に極端な場合だけ報告する
         var tooHigh = !buffChanged && measured > pv.gain * 10 + pv.cpsBefore * 0.05;
@@ -674,7 +698,7 @@ function fmt(n) {
         if (tooHigh && pv.achBefore != null && achievementsWon() > pv.achBefore) tooHigh = false;
         if (tooLow || tooHigh) {
           state.anomalies = (state.anomalies || 0) + 1;
-          reportError('購入後の増産が予測と大きく違います（' + pv.label + '、予測 ' + fmt(Math.round(pv.gain)) + ' → 実測 ' + fmt(Math.round(measured)) + '、購入は継続します）');
+          reportError('購入後の増産が予測と大きく違います（' + pv.label + '、予測 ' + fmt(Math.round(pv.gain)) + ' → 実測 ' + fmt(Math.round(measured)) + (measParts ? '［CpS分 ' + fmt(Math.round(measParts.dCps)) + '、クリック分 ' + fmt(Math.round(measParts.dClick)) + '］' : '') + '、購入は継続します）');
         } else {
           state.anomalies = 0;
         }
@@ -872,7 +896,8 @@ function fmt(n) {
       buildings: buildings,
       lumps: (typeof G.lumps === 'number') ? G.lumps : 0,
       heavenlyChips: (typeof G.heavenlyChips === 'number') ? Math.floor(G.heavenlyChips) : 0,
-      mode: state.mode, running: state.running, lastAction: state.lastAction || ''
+      mode: state.mode, running: state.running, lastAction: state.lastAction || '',
+      recentLogs: (state.logs || []).slice(0, 15)
     };
     status.scriptVersion = SCRIPT_VERSION;
     try {
