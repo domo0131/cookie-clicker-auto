@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.2.4
+// @version      2.2.5
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.2.4'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.2.5'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -62,6 +62,9 @@
     logs: gmGet('ccauto_logs', []),
     lastAction: gmGet('ccauto_lastAction', ''),
     halted: gmGet('ccauto_halted', 0) === 1, // 異常停止は再読み込みしても維持する（パネルの再開で解除）
+    actualNext: null, // 実際に次に買うもの（目標そのもの／合間の先行購入／貯金中の候補）。buyStep が毎回そろえる
+    // 第1目標までの間に実際に買った直近のもの（目標が変わるまで保持する）
+    lastInterim: (function () { try { var v = gmGet('ccauto_lastInterim', null); return (v && v.label) ? v : null; } catch (e) { return null; } })(),
     startedAt: Date.now()
   };
 
@@ -800,6 +803,8 @@ function fmt(n) {
         // それ以外はAのために貯金する（固定の貯金時間ルールは v2.0 で廃止）
         var R = totalIncome(ev.cpsNow);
         var bestB = null, bestTBA = Infinity;
+        // watchB: 順序比較で「次に割り込む可能性が最も高い」買える候補。貯金中でも表示して、実際に何を買うつもりかを見えるようにする
+        var watchB = null, watchTBA = Infinity;
         if (R > 0 && top.gain > 0) {
           var tA = (top.price - bank) / R;
           for (var ci = 1; ci < ev.list.length; ci++) {
@@ -809,16 +814,23 @@ function fmt(n) {
             if (top.kind === 'set' && B.kind === 'building' && top.buildingRef && B.ref === top.buildingRef) { bestB = B; bestTBA = 0; break; }
             var tAB = tA + B.price / (R + top.gain); // Aを買った直後の残高は0として計算する
             var tBA = (top.price - (bank - B.price)) / (R + B.gain);
+            if (tBA < watchTBA) { watchB = B; watchTBA = tBA; }
             if (tBA < tAB && tBA < bestTBA) { bestB = B; bestTBA = tBA; }
           }
         }
         if (bestB) {
           pick = bestB;
         } else {
+          // 貯金中でも「実際に次に買う可能性があるもの」を状態に残す（買える候補が無いときは null = 本当に貯金だけ）
+          state.actualNext = watchB ? { label: watchB.label, price: Math.round(watchB.price), kind: watchB.kind, mode: 'candidate' } : null;
           if (boughtTotal === 0) { setSaveTarget(top, ev.cpsNow, true); state.goalTarget = ''; state.goalDetail = ''; setGoals(top, null, 1, true, bank, totalIncome(ev.cpsNow)); }
           break;
         }
       }
+      // 実際に次に買うもの（目標そのものか、目標より先に買う合間の品か）を状態に残す
+      state.actualNext = (pick === top)
+        ? { label: top.label, price: Math.round(top.price), kind: top.kind, mode: 'goal' }
+        : { label: pick.label, price: Math.round(pick.price), kind: pick.kind, mode: 'interim' };
       state.nextTarget = pick.label;
       state.nextDetail = (pick.kind === 'set') ? '倍強化まで買い進め中' : '';
       state.targetPrice = 0;
@@ -843,6 +855,14 @@ function fmt(n) {
         countKey = pick.ref.name;
       }
       if (!doBuy(buyCand, true)) break;
+      // 第1目標とは違うものを買ったら「目標までの間に買ったもの」として残す（目標そのものを買ったら消す）
+      if (pick.label !== top.label) {
+        state.lastInterim = { label: (pick.kind === 'set' ? buyCand.label : pick.label), price: Math.round(buyCand.price), at: Date.now(), goal: top.label };
+        try { gmSet('ccauto_lastInterim', state.lastInterim); } catch (e) { /* ignore */ }
+      } else if (state.lastInterim) {
+        state.lastInterim = null;
+        try { gmSet('ccauto_lastInterim', ''); } catch (e) { /* ignore */ }
+      }
       boughtTotal++;
       if (!boughtCounts[countKey]) boughtCounts[countKey] = { n: 0, spent: 0 };
       boughtCounts[countKey].n++;
@@ -1018,7 +1038,12 @@ function fmt(n) {
         detail: state.nextDetail || '',
         goalDetail: state.goalDetail || '',
         goal1: state.goal1 || null,
-        goal2: state.goal2 || null
+        goal2: state.goal2 || null,
+        // 実際に次に買うもの（next）と、目標までの間に実際に買った直近のもの（last。目標が変わっていたら null）
+        actual: {
+          next: state.actualNext || null,
+          last: (state.lastInterim && topD && state.lastInterim.goal === topD.label) ? state.lastInterim : null
+        }
       };
     } catch (e) { /* ignore */ }
     // エラー記録（新しい順・最大10件）を状態に載せる。Muse側のチェッカーが新しいものをチャットへ報告する
@@ -1363,6 +1388,18 @@ function fmt(n) {
       nxHtml += goalLine('第1目標', state.goal1);
       if (state.goal2) nxHtml += '<br>' + goalLine('第2目標', state.goal2);
       else if (state.goalSaving) nxHtml += '<br>第2目標: なし（第1目標のために貯金中）';
+      // 目標表示だけでは「実際は違うものを買っている」ことが分からないため、実際の動きも同じ欄に出す
+      if (state.actualNext) {
+        var an = state.actualNext;
+        nxHtml += '<br>実際に次に買う: ' + esc(an.label) + '（' + fmt(an.price) + '）';
+        if (an.mode === 'interim') nxHtml += '<br><span style="color:#ffd98a;">第1目標より先に買います</span>';
+        else if (an.mode === 'candidate') nxHtml += '<br><span style="color:#ffd98a;">貯金の合間に買う候補（効率が勝れば先に買います）</span>';
+      }
+      if (state.lastInterim && state.lastInterim.goal === state.goal1.label) {
+        var liD = new Date(state.lastInterim.at);
+        var liT = ('0' + liD.getHours()).slice(-2) + ':' + ('0' + liD.getMinutes()).slice(-2);
+        nxHtml += '<br>目標までの間に購入: ' + esc(state.lastInterim.label) + '（' + liT + '）';
+      }
     } else {
       nxHtml = '次: ' + esc(state.nextTarget || '―') +
         (state.nextDetail ? '<br><span style="color:#ffd98a;">' + esc(state.nextDetail) + '</span>' : '');
