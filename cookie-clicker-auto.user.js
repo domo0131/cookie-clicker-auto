@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.2.7
+// @version      2.2.8
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.2.7'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.2.8'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -123,6 +123,16 @@
         var bf = b[k];
         if (bf && bf.time > 0 && ((bf.multClick || 1) > 1 || /click/i.test(k))) return true;
       }
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
+  // 何らかのバフ（生産系も含む）が掛かっているか。生産バフ中は派生値が倍率ぶん膨らみ、
+  // シミュレーションの増分が恒常値とずれるため、全体系の測定を避ける判断に使う
+  function anyBuffActive() {
+    try {
+      var b = W.Game.buffs || {};
+      for (var k in b) if (b[k] && b[k].time > 0) return true;
     } catch (e) { /* ignore */ }
     return false;
   }
@@ -294,8 +304,8 @@ function fmt(n) {
     var dcps = 0, dclick = 0;
     try {
       var G = W.Game;
-      // クリック系バフの最中はクリック値の増分が一時的に巨大になり、恒常効率の順位付けに使えないため、この回は測らない（バフ終了後に再評価される）
-      if (clickBuffActive()) return 0;
+      // バフの最中は派生値（CpS・クリック値）が倍率ぶん膨らみ、増分が恒常値とずれるため、この回は測らない（バフ終了後に再評価される）
+      if (anyBuffActive()) return 0;
       // 基準の派生値を現在の実状態に揃えてから測る（古い派生キャッシュが基準だと、復元照合で実害のない不一致になる）
       try { G.CalculateGains(); } catch (e0) { /* ignore */ }
       var prod0 = readProduction();
@@ -635,6 +645,19 @@ function fmt(n) {
   function doBuy(cand, quiet) {
     var G = W.Game;
     var bankBefore = G.cookies;
+    // 購入後検証の物差しを固定するため、購入時点の予測内訳（全体系のみ）とクリック実測速度を控える。
+    // キャッシュは購入直後に捨てられるので、買う前に読むこと
+    var preParts = null;
+    try {
+      if (cand.kind === 'upgrade' && cand.ref && upGainCache[cand.ref.name]) {
+        var uc0 = upGainCache[cand.ref.name];
+        if (typeof uc0.dcps === 'number' && typeof uc0.dclick === 'number' && (uc0.dcps > 0 || uc0.dclick > 0)) {
+          preParts = { cps: uc0.dcps, click: uc0.dclick };
+        }
+      }
+    } catch (eP) { preParts = null; }
+    var preRate = 0;
+    try { var mr = measuredClickRate(); if (isFinite(mr) && mr > 0) preRate = mr; } catch (eR) { preRate = 0; }
     // 購入後検証の物差しは readProduction() に統一する（シミュレーションと同じ読み方）
     var prodBefore = null;
     try { prodBefore = readProduction(); } catch (e) { /* ignore */ }
@@ -646,7 +669,7 @@ function fmt(n) {
         cand.ref.buy(1);
         if (cand.ref.amount > before) {
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
-          state.pendingVerify = { label: cand.label, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature() };
+          state.pendingVerify = { label: cand.label, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
           gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
           if (!quiet) {
             log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
@@ -658,7 +681,7 @@ function fmt(n) {
         cand.ref.buy();
         if (cand.ref.bought) {
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
-          state.pendingVerify = { label: cand.label, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature() };
+          state.pendingVerify = { label: cand.label, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
           gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
           if (!quiet) {
             log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
@@ -743,13 +766,16 @@ function fmt(n) {
     // 前回購入の実測検証（ゲーム側の再計算が済んだこのタイミングで照合する）
     if (state.pendingVerify) {
       var pv = state.pendingVerify;
-      // 全体系の gain にはクリック値の増分（実測速度で換算）が含まれるため、検証も同じ物差しで照合する
+      // 検証の物差しは購入時点で固定する: クリック増分の換算には購入時の実測速度 (rateAtBuy) を使い、
+      // 予測側も内訳 (predCps/predClick) があれば同じ速度で組み立て直す。検証時点の速度で測り直すと
+      // 端末負荷などの変動だけで乖離が出る（v2.2.8: ChatGPT相談に基づく PASS/FAIL/SKIP 分類方式）
+      var rateV = (pv && isFinite(pv.rateAtBuy) && pv.rateAtBuy > 0) ? pv.rateAtBuy : 0;
       var measured = null;
       var measParts = null;
       try {
         var prodNow = readProduction();
         var dCpsPart = prodNow.cps - pv.cpsBefore;
-        var dClickPart = Math.max(0, prodNow.click - (pv.clickBefore || 0)) * measuredClickRate();
+        var dClickPart = Math.max(0, prodNow.click - (pv.clickBefore || 0)) * (rateV > 0 ? rateV : measuredClickRate());
         measured = dCpsPart + dClickPart;
         measParts = { dCps: dCpsPart, dClick: dClickPart };
       } catch (e) { measured = null; }
@@ -759,25 +785,46 @@ function fmt(n) {
       if (measured === null) {
         reportError('購入後の検証でエラーが出ました（購入は継続します）');
       } else if (pv.gain > 0) {
+        // 予測値: 内訳があれば購入時速度で組み立て直したもの、なければ購入時に使った gain そのもの
+        var predV = pv.gain;
+        if (typeof pv.predCps === 'number' && typeof pv.predClick === 'number' && rateV > 0) {
+          predV = pv.predCps + pv.predClick * rateV;
+        }
         // 購入と検証のあいだにゴールデンクッキー等の効果が始まった/終わった場合は、測定が信用できないため判定しない
         var buffChanged = pv.buffs != null && buffSignature() !== pv.buffs;
         // クリック系バフ（Click frenzy 等）が購入時・検証時のどちらかに掛かっていたら、クリック値の実測が大きく振れるため判定しない
         if (/click/i.test(pv.buffs || '') || /click/i.test(buffSignature() || '')) buffChanged = true;
-        var tooLow = !buffChanged && measured < pv.gain * 0.5;
-        // 増えすぎ側は、予測に入らない相乗効果などで普通に起こるため、本当に極端な場合だけ報告する
-        var tooHigh = !buffChanged && measured > pv.gain * 10 + pv.cpsBefore * 0.05;
-        // 購入で実績が増えた場合、ミルク経由の伸びは予測に入らないため、過大側は異常扱いしない
-        if (tooHigh && pv.achBefore != null && achievementsWon() > pv.achBefore) tooHigh = false;
+        // 実績の増減は比較条件の変化として扱う（増加=ミルク経由の伸びが予測に入らない、減少=状態変化）。判定はせず数値をメモに残す
+        var achNowV = null;
+        try { achNowV = achievementsWon(); } catch (eA) { achNowV = null; }
+        var achChanged = pv.achBefore != null && achNowV != null && achNowV !== pv.achBefore;
         // 予測自体が購入前の総生産の3倍を超える場合は、測定条件が崩れた値なので判定しない（記録のみ）
-        var predictionInvalid = pv.cpsBefore > 0 && pv.gain > pv.cpsBefore * 3;
-        if (predictionInvalid) {
+        var predictionInvalid = pv.cpsBefore > 0 && predV > pv.cpsBefore * 3;
+        var partsTxt = measParts ? '［CpS分 ' + fmt(Math.round(measParts.dCps)) + '、クリック分 ' + fmt(Math.round(measParts.dClick)) + '］' : '';
+        if (rateV <= 0) {
+          // 購入時速度が記録されていない（旧版からの持ち越し等）場合は判定せず、数値だけ残す
+          log('検証メモ: ' + pv.label + ' は購入時のクリック速度が無いため判定しませんでした（予測 ' + fmt(Math.round(predV)) + ' → 実測 ' + fmt(Math.round(measured)) + partsTxt + '）');
+          state.anomalies = 0;
+        } else if (predictionInvalid) {
           log('検証メモ: ' + pv.label + ' の予測が大きすぎるため判定しませんでした');
           state.anomalies = 0;
-        } else if (tooLow || tooHigh) {
-          state.anomalies = (state.anomalies || 0) + 1;
-          reportError('購入後の増産が予測と大きく違います（' + pv.label + '、予測 ' + fmt(Math.round(pv.gain)) + ' → 実測 ' + fmt(Math.round(measured)) + (measParts ? '［CpS分 ' + fmt(Math.round(measParts.dCps)) + '、クリック分 ' + fmt(Math.round(measParts.dClick)) + '］' : '') + '、購入は継続します）');
-        } else {
+        } else if (buffChanged || achChanged) {
+          log('検証メモ: ' + pv.label + ' は比較条件の変化（' + (buffChanged ? 'バフ変化' : '実績変化') + '）のため判定しませんでした（予測 ' + fmt(Math.round(predV)) + ' → 実測 ' + fmt(Math.round(measured)) + partsTxt + '）');
           state.anomalies = 0;
+        } else {
+          var tooLow = measured < predV * 0.5;
+          // 増えすぎ側は、予測に入らない相乗効果などで普通に起こるため、本当に極端な場合だけ報告する
+          var tooHigh = measured > predV * 3 + pv.cpsBefore * 0.05;
+          if (tooLow || tooHigh) {
+            state.anomalies = (state.anomalies || 0) + 1;
+            reportError('購入後の増産が予測と大きく違います（' + pv.label + '、予測 ' + fmt(Math.round(predV)) + ' → 実測 ' + fmt(Math.round(measured)) + partsTxt + '、購入は継続します）');
+          } else {
+            // エラーにはしないが、±25%を超えるずれは診断用に残す
+            if (Math.abs(measured - predV) > predV * 0.25) {
+              log('検証メモ: ' + pv.label + ' の増産が予測とややずれました（予測 ' + fmt(Math.round(predV)) + ' → 実測 ' + fmt(Math.round(measured)) + partsTxt + '）');
+            }
+            state.anomalies = 0;
+          }
         }
       } else {
         state.anomalies = 0;
