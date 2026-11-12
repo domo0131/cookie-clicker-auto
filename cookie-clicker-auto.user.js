@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.2.3
+// @version      2.2.4
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.2.3'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.2.4'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -109,6 +109,19 @@
       for (var k in b) if (b[k] && b[k].time > 0) names.push(k);
       return names.sort().join(',');
     } catch (e) { return ''; }
+  }
+
+  // クリック系バフ（Click frenzy 等）が掛かっているか。最中はクリック値が一時的に跳ね上がり、
+  // 実測値が恒常的な効率の順位付けに使えないため、全体系の測定を避ける判断に使う
+  function clickBuffActive() {
+    try {
+      var b = W.Game.buffs || {};
+      for (var k in b) {
+        var bf = b[k];
+        if (bf && bf.time > 0 && ((bf.multClick || 1) > 1 || /click/i.test(k))) return true;
+      }
+    } catch (e) { /* ignore */ }
+    return false;
   }
 
   function nowTime() {
@@ -261,6 +274,7 @@ function fmt(n) {
   // CpS・クリック値・所持金・実績数・所有数・過去最高CpS記録が元通りか照合し、
   // 1つでも合わなければ、このセッションではシミュレーション自体を止める。
   var simDisabled = gmGet('ccauto_simDisabled', 0) === 1; // 一度止めたら再読み込みしても戻さない
+  var simFailCount = 0; // 全体系の復元照合の連続失敗数（3回続いたら測定方法を停止する）
   var upGainCache = {}; // name -> {dcps, dclick, at, ach, cps, bOwned, uOwned}
   function simulatedUpgradeGain(up, cpsNow) {
     if (simDisabled) return 0;
@@ -277,18 +291,24 @@ function fmt(n) {
     var dcps = 0, dclick = 0;
     try {
       var G = W.Game;
+      // クリック系バフの最中はクリック値の増分が一時的に巨大になり、恒常効率の順位付けに使えないため、この回は測らない（バフ終了後に再評価される）
+      if (clickBuffActive()) return 0;
+      // 基準の派生値を現在の実状態に揃えてから測る（古い派生キャッシュが基準だと、復元照合で実害のない不一致になる）
+      try { G.CalculateGains(); } catch (e0) { /* ignore */ }
       var prod0 = readProduction();
       var cps0 = prod0.cps, click0 = prod0.click;
-      var bank0 = G.cookies, ach0 = ach, uOwned0 = uOwned;
+      var bank0 = G.cookies, ach0 = achievementCount(), uOwned0 = uOwned;
       var origBought = up.bought;
       var highest0 = (typeof G.cookiesPsRawHighest === 'number') ? G.cookiesPsRawHighest : null;
-      var failed = false;
+      var failed = false, wild = false;
       up.bought = 1;
       try {
         G.CalculateGains();
         var prod1 = readProduction();
         dcps = Math.max(0, prod1.cps - cps0);
         dclick = Math.max(0, prod1.click - click0);
+        // CpS成分が現在の総生産の2倍を超える増え方は測定の乱れとして無効にする（全体％・子猫の正規の効果はこの範囲に収まる）
+        if (dcps > Math.max(1, cps0 * 2)) wild = true;
       } catch (e1) { failed = true; }
       try {
         up.bought = origBought;
@@ -296,27 +316,49 @@ function fmt(n) {
       } catch (e2) { failed = true; } // 復元側の例外は握りつぶさず失敗として扱う
       // 過去最高CpSの記録は再計算で膨らむことがあるため、元の値に戻す
       if (highest0 !== null) { try { G.cookiesPsRawHighest = highest0; } catch (e3) { /* ignore */ } }
+      // 照合は分類して扱う: 実状態の不整合（hardFail）だけを失敗として数える。
+      // 実績の増加はミルク経由で派生値が正当に増えた可能性があり、今回の測定だけを無効にする。
+      // 派生値だけのずれは、再計算をもう1回かけて収まるか試してから判定する。
+      var hardFail = failed, achJump = false, driftFail = false;
       if (!failed) {
         try {
           var tol = Math.max(1, cps0 * 0.001);
+          var clickTol = Math.max(0.01, click0 * 0.001);
           var prodR = readProduction();
+          var achNowG = achievementCount();
           if (up.bought !== origBought ||
-              Math.abs(prodR.cps - cps0) > tol ||
-              Math.abs(prodR.click - click0) > Math.max(0.01, click0 * 0.001) ||
               (highest0 !== null && G.cookiesPsRawHighest !== highest0) ||
-              G.cookies !== bank0 || achievementCount() !== ach0 ||
+              G.cookies !== bank0 || achNowG < ach0 ||
               (G.UpgradesOwned || 0) !== uOwned0) {
-            failed = true;
+            hardFail = true;
+          } else {
+            if (achNowG > ach0) achJump = true;
+            if (Math.abs(prodR.cps - cps0) > tol || Math.abs(prodR.click - click0) > clickTol) {
+              try { G.CalculateGains(); } catch (e5) { /* ignore */ }
+              var prodR2 = readProduction();
+              if (Math.abs(prodR2.cps - cps0) > tol || Math.abs(prodR2.click - click0) > clickTol) driftFail = true;
+            }
           }
-        } catch (e4) { failed = true; }
+        } catch (e4) { hardFail = true; }
       }
-      if (failed) {
-        // 測定方法だけを止め、購入自体は止めない（方針: 止まるのが一番の非効率。異常は報告する）
-        simDisabled = true;
-        gmSet('ccauto_simDisabled', 1);
-        upGainCache = {};
+      if (hardFail) {
+        // 測定方法だけを止め、購入自体は止めない（方針: 止まるのが一番の非効率。異常は報告する）。
+        // 1回では止めず、3回続いたら全体系の測定を停止する（建物側と同じ考え方）
+        simFailCount++;
         dcps = 0; dclick = 0;
-        reportError('全体系の効果測定で状態の不一致を検知したため、この測定方法だけを停止しました（購入は継続します）');
+        if (simFailCount >= 3) {
+          simDisabled = true;
+          gmSet('ccauto_simDisabled', 1);
+          upGainCache = {};
+          reportError('全体系の効果測定で状態の不一致が続いたため、この測定方法だけを停止しました（購入は継続します）');
+        } else {
+          log('測定メモ: 全体系の復元照合で不一致（' + simFailCount + '回目）。今回の測定だけ無効にしました');
+        }
+      } else if (wild || achJump || driftFail) {
+        dcps = 0; dclick = 0;
+        log('測定メモ: 全体系の実測を無効にしました（' + (wild ? '異常値' : (achJump ? '実績増加' : '派生値のずれ')) + '）');
+      } else {
+        simFailCount = 0;
       }
     } catch (e) { dcps = 0; dclick = 0; }
     upGainCache[name] = { dcps: dcps, dclick: dclick, at: now, ach: ach, cps: cpsNow, bOwned: bOwned, uOwned: uOwned };
@@ -349,6 +391,10 @@ function fmt(n) {
       var G = W.Game;
       var bank0 = G.cookies, ach0 = ach, bOwned0 = bOwned;
       var amt0 = obj.amount || 0;
+      // 測定前の派生値が古いキャッシュのままだと、復元後の値と基準がずれて実害のない不一致になる。
+      // 何も変更しない再計算を1回かけて基準を現在の実状態に揃え、基準側の実績数も取り直す
+      try { G.CalculateGains(); } catch (e0) { /* ignore */ }
+      ach0 = achievementCount();
       var highest0 = (typeof G.cookiesPsRawHighest === 'number') ? G.cookiesPsRawHighest : null;
       // 増産は「全建物の生産合計（storedTotalCps）の増え方」で測る。
       // 再計算（CalculateGains）が必ず更新する値だけを使うので、メインループ側で管理される値
@@ -378,17 +424,37 @@ function fmt(n) {
       if (highest0 !== null) { try { G.cookiesPsRawHighest = highest0; } catch (e3) { /* ignore */ } }
       try { if ((G.BuildingsOwned || 0) !== bOwned0) G.BuildingsOwned = bOwned0; } catch (e5) { /* ignore */ }
       // どの項目が一致しなかったかを記録する（原因の切り分け用に報告へ含める）
+      // 実状態（軒数・所持金・所有数・実績の減少）は厳密に照合する。派生値である storedCps 合計は
+      // 段階判定にする: 0.01%以内=正常 / 0.1%以内=再計算でもう1回照合し、収まらなければ今回の測定だけ
+      // 無効（概算へ・測定停止や報告はしない）/ 0.1%超=従来通りの不一致として扱う。
+      // 実績が増えた場合は、ミルク経由で派生値が正当に増えたものとして、今回の測定だけを無効にする。
       var badFields = [];
+      var achJump = false, lightDrift = false;
       if (!failed) {
         try {
           var tolS = Math.max(0.001, sum0 * 0.0001);
+          var driftS = Math.abs(storedSum() - sum0);
           if ((obj.amount || 0) !== amt0) badFields.push('amount');
-          if (Math.abs(storedSum() - sum0) > tolS) badFields.push('storedCps');
           if (G.cookies !== bank0) badFields.push('cookies');
-          // 実績が「増えた」場合は、測定中に正当に解放されたものとして失敗扱いにしない（どのみち次に買えば解放される）
-          if (achievementCount() < ach0) badFields.push('achievements');
+          var achNowB = achievementCount();
+          if (achNowB < ach0) badFields.push('achievements');
+          else if (achNowB > ach0) achJump = true;
           if ((G.BuildingsOwned || 0) !== bOwned0) badFields.push('buildingsOwned');
+          if (!badFields.length && !achJump && driftS > tolS) {
+            if (driftS <= Math.max(0.001, sum0 * 0.001)) {
+              try { G.CalculateGains(); } catch (e9) { /* ignore */ }
+              if (Math.abs(storedSum() - sum0) > tolS) lightDrift = true;
+            } else {
+              badFields.push('storedCps');
+            }
+          }
         } catch (e4) { badFields.push('exception'); }
+      }
+      if (!failed && !wild && !badFields.length && (achJump || lightDrift)) {
+        gain = 0;
+        log('測定メモ: ' + name + ' の実測は' + (achJump ? '実績増加' : '派生値のずれ') + 'のため概算に切り替えました');
+        bGainCache[name] = { gain: 0, at: now, ach: ach, cps: cpsNow, bOwned: bOwned, uOwned: uOwned };
+        return 0;
       }
       if (failed || wild || badFields.length) {
         bSimFailsBy[name] = (bSimFailsBy[name] || 0) + 1;
@@ -699,7 +765,12 @@ function fmt(n) {
         var tooHigh = !buffChanged && measured > pv.gain * 10 + pv.cpsBefore * 0.05;
         // 購入で実績が増えた場合、ミルク経由の伸びは予測に入らないため、過大側は異常扱いしない
         if (tooHigh && pv.achBefore != null && achievementsWon() > pv.achBefore) tooHigh = false;
-        if (tooLow || tooHigh) {
+        // 予測自体が購入前の総生産の3倍を超える場合は、測定条件が崩れた値なので判定しない（記録のみ）
+        var predictionInvalid = pv.cpsBefore > 0 && pv.gain > pv.cpsBefore * 3;
+        if (predictionInvalid) {
+          log('検証メモ: ' + pv.label + ' の予測が大きすぎるため判定しませんでした');
+          state.anomalies = 0;
+        } else if (tooLow || tooHigh) {
           state.anomalies = (state.anomalies || 0) + 1;
           reportError('購入後の増産が予測と大きく違います（' + pv.label + '、予測 ' + fmt(Math.round(pv.gain)) + ' → 実測 ' + fmt(Math.round(measured)) + (measParts ? '［CpS分 ' + fmt(Math.round(measParts.dCps)) + '、クリック分 ' + fmt(Math.round(measParts.dClick)) + '］' : '') + '、購入は継続します）');
         } else {
