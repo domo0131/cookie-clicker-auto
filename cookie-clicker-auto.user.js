@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.2.8
+// @version      2.2.9
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.2.8'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.2.9'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -669,7 +669,7 @@ function fmt(n) {
         cand.ref.buy(1);
         if (cand.ref.amount > before) {
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
-          state.pendingVerify = { label: cand.label, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
+          state.pendingVerify = { label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
           gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
           if (!quiet) {
             log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
@@ -681,7 +681,7 @@ function fmt(n) {
         cand.ref.buy();
         if (cand.ref.bought) {
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
-          state.pendingVerify = { label: cand.label, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
+          state.pendingVerify = { label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
           gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
           if (!quiet) {
             log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
@@ -770,12 +770,15 @@ function fmt(n) {
       // 予測側も内訳 (predCps/predClick) があれば同じ速度で組み立て直す。検証時点の速度で測り直すと
       // 端末負荷などの変動だけで乖離が出る（v2.2.8: ChatGPT相談に基づく PASS/FAIL/SKIP 分類方式）
       var rateV = (pv && isFinite(pv.rateAtBuy) && pv.rateAtBuy > 0) ? pv.rateAtBuy : 0;
+      // 建物・セットの予測は生産（CpS）分のみで、クリック値の増分は含まない。検証でもクリック分を
+      // 足すと、買うたびに「実測が約5倍」で誤判定になるため、建物系は CpS 分だけで比べる (v2.2.9)
+      var isBuildingKind = pv && (pv.kind === 'building' || pv.kind === 'set');
       var measured = null;
       var measParts = null;
       try {
         var prodNow = readProduction();
         var dCpsPart = prodNow.cps - pv.cpsBefore;
-        var dClickPart = Math.max(0, prodNow.click - (pv.clickBefore || 0)) * (rateV > 0 ? rateV : measuredClickRate());
+        var dClickPart = isBuildingKind ? 0 : Math.max(0, prodNow.click - (pv.clickBefore || 0)) * (rateV > 0 ? rateV : measuredClickRate());
         measured = dCpsPart + dClickPart;
         measParts = { dCps: dCpsPart, dClick: dClickPart };
       } catch (e) { measured = null; }
@@ -800,7 +803,7 @@ function fmt(n) {
         var achChanged = pv.achBefore != null && achNowV != null && achNowV !== pv.achBefore;
         // 予測自体が購入前の総生産の3倍を超える場合は、測定条件が崩れた値なので判定しない（記録のみ）
         var predictionInvalid = pv.cpsBefore > 0 && predV > pv.cpsBefore * 3;
-        var partsTxt = measParts ? '［CpS分 ' + fmt(Math.round(measParts.dCps)) + '、クリック分 ' + fmt(Math.round(measParts.dClick)) + '］' : '';
+        var partsTxt = measParts ? (isBuildingKind ? '［CpS分 ' + fmt(Math.round(measParts.dCps)) + '］' : '［CpS分 ' + fmt(Math.round(measParts.dCps)) + '、クリック分 ' + fmt(Math.round(measParts.dClick)) + '］') : '';
         if (rateV <= 0) {
           // 購入時速度が記録されていない（旧版からの持ち越し等）場合は判定せず、数値だけ残す
           log('検証メモ: ' + pv.label + ' は購入時のクリック速度が無いため判定しませんでした（予測 ' + fmt(Math.round(predV)) + ' → 実測 ' + fmt(Math.round(measured)) + partsTxt + '）');
