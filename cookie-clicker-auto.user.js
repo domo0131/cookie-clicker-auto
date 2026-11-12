@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.2.2
+// @version      2.2.3
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -31,11 +31,12 @@
     logMax: 60,              // パネルに残す購入ログの件数
     reportSecret: '', // （v2.2.0で廃止）合言葉はコードに書かず、パネルの「🔑 合言葉設定」から保存する（公開リポジトリに載せないため）
     reportIntervalMs: 60000,  // 状態送信の間隔（ミリ秒）。送信先URLはパネルの「送信先設定」から保存する
-    updateCheckMinutes: 10   // 新しい版が出ていないか GitHub を確認する間隔（分）。新版があれば保存して再読み込みし、取り込む
+    updateCheckMinutes: 10,   // 新しい版が出ていないか GitHub を確認する間隔（分）。新版があれば保存して再読み込みし、取り込む
+    clickBudgetMs: 5         // クリック処理に1回のtickで使う時間の上限（ミリ秒）。ゲーム本体の処理を飢えさせないための制限
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.2.2'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.2.3'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -801,7 +802,7 @@ function fmt(n) {
   function scheduleClicks() {
     if (clickTimer) { clearInterval(clickTimer); clickTimer = null; }
     if (clickRate() <= 0) return;
-    clickTimer = setInterval(clickStep, 50);
+    clickTimer = setInterval(clickStep, 15);
   }
 
   var clickAcc = 0;
@@ -809,17 +810,49 @@ function fmt(n) {
     try { return W.Game.computedMouseCps || 0; } catch (e) { return 0; }
   }
 
+  // クリック1回ごとに発生する演出（粒子・浮かぶ数字・高画質表示）は処理が重く、実測の
+  // クリック速度を大きく下げていた。専用機では見た目より速度を優先し、最初に一度だけ切る。
+  var lightPrefsApplied = false;
+  function applyLightPrefs() {
+    if (lightPrefsApplied) return;
+    try {
+      var p = W.Game.prefs;
+      if (p) {
+        var changed = [];
+        if (p.particles) { p.particles = 0; changed.push('粒子'); }
+        if (p.numbers) { p.numbers = 0; changed.push('浮かぶ数字'); }
+        if (p.fancy) { p.fancy = 0; changed.push('高画質表示'); }
+        if (changed.length) log('クリック高速化のため演出を軽くしました（' + changed.join('・') + 'をオフ）');
+      }
+      lightPrefsApplied = true;
+    } catch (e) { /* ignore */ }
+  }
+
+  var clickLastAt = 0;
   function clickStep() {
     if (!state.running) return;
     if (!gameReady() || isChallengePage()) return;
     var r = clickRate();
     if (r <= 0) return;
-    clickAcc += r / 20; // 50msごとに rate/20 回ぶんをまとめてクリック
+    applyLightPrefs();
+    // 前回tickからの実経過時間ぶんを蓄積する（タイマーのブレや処理の遅れに追随させる）
+    var now = Date.now();
+    if (clickLastAt > 0) clickAcc += r * (now - clickLastAt) / 1000;
+    clickLastAt = now;
     var n = Math.floor(clickAcc);
-    clickAcc -= n;
-    for (var i = 0; i < n; i++) {
+    if (n <= 0) return;
+    // 1tickあたりの時間予算の中でまとめて叩く。予算を超えたら残りは次tickへ回し、
+    // ゲーム本体（生産・描画・保存）の処理を飢えさせない。
+    var t0 = Date.now();
+    var done = 0;
+    while (done < n) {
       try { W.Game.ClickCookie(); } catch (e) { break; }
+      done++;
+      if ((done & 3) === 0 && Date.now() - t0 >= CONFIG.clickBudgetMs) break;
     }
+    clickAcc -= done;
+    if (clickAcc > r) clickAcc = r; // 溜め込みは最大で設定値の1秒ぶんまで
+    if (clickAcc < 0) clickAcc = 0;
   }
 
   function goldenStep() {
