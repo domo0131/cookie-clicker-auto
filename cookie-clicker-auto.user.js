@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.2.6
+// @version      2.2.7
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.2.6'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.2.7'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1009,6 +1009,18 @@ function fmt(n) {
     if (!tr || typeof tr.resets !== 'number') {
       tr = { resets: resets, startedAt: now, peakCps: 0, lastTotal: 0 };
     }
+    // 一回限りの補正（v2.2.7）: v2.2.6 で記録を始めた1周目の開始時刻はスクリプト導入時刻
+    // （2026-11-12 17:01 JST）になっており、本当の開始（Tabセットアップ完了 = 2026-11-11 14:28 JST）
+    // より約26.6時間遅れている。周回の所要時間と効率表示が歪むため、正しい時刻へ直す
+    try {
+      if (!gmGet('ccauto_runStartFix1', 0) && resets === 0 && (tr.startedAt || 0) >= 1794470400000) {
+        var existingLog = gmGet('ccauto_runLog', []);
+        if (!Array.isArray(existingLog) || existingLog.length === 0) {
+          tr.startedAt = 1794374880000; // 2026-11-11T14:28:00+09:00
+        }
+        gmSet('ccauto_runStartFix1', 1);
+      }
+    } catch (e) { /* ignore */ }
     if (resets > tr.resets) {
       // 昇天があった: 前の周回を確定して記録する（複数回まとめて起きた場合は合算の1件として残す）
       var logArr = [];
