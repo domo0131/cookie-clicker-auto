@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.2.5
+// @version      2.2.6
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.2.5'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.2.6'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -998,6 +998,52 @@ function fmt(n) {
 
   /* ---------------- 状態の送信（Muse側で見るため） ---------------- */
 
+  // 周回（昇天）ごとの記録。昇天回数・獲得チップ・所要時間・最高CpSを周回ごとに残し、
+  // スペースの「周回ごとの効率」グラフの元データとして状態送信に載せる
+  function trackRun(G, cpsNow, totalEarned) {
+    var resets = 0;
+    try { resets = G.resets || 0; } catch (e) { resets = 0; }
+    var now = Date.now();
+    var tr = null;
+    try { tr = gmGet('ccauto_runTrack', null); } catch (e) { tr = null; }
+    if (!tr || typeof tr.resets !== 'number') {
+      tr = { resets: resets, startedAt: now, peakCps: 0, lastTotal: 0 };
+    }
+    if (resets > tr.resets) {
+      // 昇天があった: 前の周回を確定して記録する（複数回まとめて起きた場合は合算の1件として残す）
+      var logArr = [];
+      try { logArr = gmGet('ccauto_runLog', []); } catch (e) { logArr = []; }
+      if (!Array.isArray(logArr)) logArr = [];
+      var chips = Math.floor(Math.cbrt(Math.max(0, tr.lastTotal || 0) / 1e12));
+      logArr.push({
+        run: tr.resets + 1,
+        chips: chips,
+        durationSec: Math.max(0, Math.round((now - (tr.startedAt || now)) / 1000)),
+        peakCps: Math.round(tr.peakCps || 0),
+        totalEarned: Math.round(tr.lastTotal || 0),
+        endedAt: now
+      });
+      if (logArr.length > 50) logArr = logArr.slice(logArr.length - 50);
+      try { gmSet('ccauto_runLog', logArr); } catch (e) { /* ignore */ }
+      tr = { resets: resets, startedAt: now, peakCps: 0, lastTotal: 0 };
+    }
+    if (cpsNow > (tr.peakCps || 0)) tr.peakCps = cpsNow;
+    if (totalEarned > 0) tr.lastTotal = totalEarned;
+    try { gmSet('ccauto_runTrack', tr); } catch (e) { /* ignore */ }
+    var runLogArr = [];
+    try { runLogArr = gmGet('ccauto_runLog', []); } catch (e) { runLogArr = []; }
+    return {
+      resets: resets,
+      runs: Array.isArray(runLogArr) ? runLogArr : [],
+      current: {
+        run: resets + 1,
+        startedAt: tr.startedAt || now,
+        peakCps: Math.round(tr.peakCps || 0),
+        chipsNow: Math.floor(Math.cbrt(Math.max(0, totalEarned || 0) / 1e12))
+      }
+    };
+  }
+
   function collectStatus() {
     var G = W.Game;
     var buildings = [];
@@ -1026,6 +1072,13 @@ function fmt(n) {
       recentLogs: (state.logs || []).slice(0, 15)
     };
     status.scriptVersion = SCRIPT_VERSION;
+    // 周回（昇天）の記録: 昇天回数・完了した周回の一覧・進行中の周回の状態
+    try {
+      var runInfo = trackRun(G, status.cps || status.cpsRaw || 0, status.totalEarned || 0);
+      status.resets = runInfo.resets;
+      status.runs = runInfo.runs;
+      status.runCurrent = runInfo.current;
+    } catch (e) { /* ignore */ }
     try {
       var evD = evaluateCandidates();
       var topD = evD.list.length ? evD.list[0] : null;
