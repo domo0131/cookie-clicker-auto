@@ -1,0 +1,1314 @@
+// ==UserScript==
+// @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
+// @namespace    muse.cookieclicker
+// @version      2.2.0
+// @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
+// @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
+// @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
+// @match        https://orteil.dashnet.org/cookieclicker/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
+// @connect      script.google.com
+// @connect      script.googleusercontent.com
+// @grant        unsafeWindow
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ================= 設定（ここだけ書き換えれば調整できます） ================= */
+  var CONFIG = {
+    mode: 'readonly',        // 'readonly' = 読み取り専用（買わずに「次に買うもの」だけ表示） / 'auto' = 自動購入する
+    buyIntervalMs: 2000,     // 購入判断の間隔（ミリ秒）
+    maxBatch: 1,             // 1回の判断で買う上限数（安全優先: 1件買って実測検証してから次へ）
+    clickPerSecond: 2,       // 大クッキーの自動クリック回数/秒（0で無効）
+    clickGolden: true,       // 黄金クッキーを自動でクリックするか（ホロボア配置中は設定に関係なく常に停止）
+    saveUpSeconds: 600,      // （v2.0で「A→B／B→Aの順序比較」に置き換えたため未使用。互換のため残置）
+    autoBackupHours: 0,      // セーブの自動書き出し間隔（時間）。0 = 自動では書き出さない（パネルのボタンで手動実行）
+    logMax: 60,              // パネルに残す購入ログの件数
+    reportSecret: '', // （v2.2.0で廃止）合言葉はコードに書かず、パネルの「🔑 合言葉設定」から保存する（公開リポジトリに載せないため）
+    reportIntervalMs: 60000  // 状態送信の間隔（ミリ秒）。送信先URLはパネルの「送信先設定」から保存する
+  };
+  /* ====================================================================== */
+
+  var SCRIPT_VERSION = '2.2.0'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+
+  // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
+  var BLOCKED_UPGRADE_WORDS = [
+    'one mind', 'communal brainsweep', 'elder pact', 'elder pledge', 'elder covenant',
+    'bingo center', 'research facility', 'specialized chocolate chips', 'antimatter condensers',
+    'one mind', 'exotic nuts', 'arcane sugar'
+  ];
+  // ※ 上記は研究系・グランマポカリプス系・危険なものを止めるための保険です。
+  //   個別に止めたいものが増えたらここに名前を足してください。
+
+  var W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+
+  function gmGet(key, def) {
+    try { var v = GM_getValue(key); return (v === undefined || v === null) ? def : v; } catch (e) { return def; }
+  }
+  function gmSet(key, val) {
+    try { GM_setValue(key, val); } catch (e) { /* 保存できなくても動作は続ける */ }
+  }
+
+  var state = {
+    running: gmGet('ccauto_running', true),
+    mode: gmGet('ccauto_mode', CONFIG.mode),
+    logs: gmGet('ccauto_logs', []),
+    lastAction: gmGet('ccauto_lastAction', ''),
+    halted: gmGet('ccauto_halted', 0) === 1, // 異常停止は再読み込みしても維持する（パネルの再開で解除）
+    startedAt: Date.now()
+  };
+
+  // 初めて入れたときだけ、パネルで自動購入を選ぶまで読み取り専用にする。
+  // 自動更新で版が上がった場合は、前の版で承認済みなら自動購入を止めない（購入が止まるのが一番の非効率のため）
+  if (gmGet('ccauto_approvedVersion', '') !== SCRIPT_VERSION) {
+    if (!gmGet('ccauto_approvedVersion', '')) state.mode = 'readonly';
+    // 新しい版では効果測定の停止フラグを解除して再挑戦する（直した版で実測を復活させるため）
+    try { gmSet('ccauto_bSimDisabled', 0); gmSet('ccauto_simDisabled', 0); gmSet('ccauto_bSimOff', '{}'); } catch (e) { /* ignore */ }
+  }
+
+  function saveState() {
+    gmSet('ccauto_running', state.running);
+    gmSet('ccauto_mode', state.mode);
+    gmSet('ccauto_logs', state.logs.slice(0, CONFIG.logMax));
+    gmSet('ccauto_lastAction', state.lastAction);
+  }
+
+  // エラーは止めずに記録し、状態送信に載せて Muse 側からチャットへ報告させる
+  function reportError(msg) {
+    log('エラー: ' + msg);
+    try {
+      var errs = gmGet('ccauto_errors', []);
+      if (!Array.isArray(errs)) errs = [];
+      errs.unshift({ ts: Date.now(), msg: msg });
+      if (errs.length > 10) errs.length = 10;
+      gmSet('ccauto_errors', errs);
+    } catch (e) { /* ignore */ }
+  }
+
+  function achievementsWon() {
+    var n = 0;
+    try {
+      var A = W.Game.AchievementsById || [];
+      for (var i = 0; i < A.length; i++) if (A[i].won) n++;
+    } catch (e) { /* ignore */ }
+    return n;
+  }
+
+  // 効果（ゴールデンクッキー等）の一覧を文字列化する。購入時と検証時で変わっていたら測定が信用できない
+  function buffSignature() {
+    try {
+      var b = W.Game.buffs || {};
+      var names = [];
+      for (var k in b) if (b[k] && b[k].time > 0) names.push(k);
+      return names.sort().join(',');
+    } catch (e) { return ''; }
+  }
+
+  function nowTime() {
+    var d = new Date();
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  function log(msg) {
+    state.lastAction = nowTime() + ' ' + msg;
+    state.logs.unshift(state.lastAction);
+    if (state.logs.length > CONFIG.logMax) state.logs.length = CONFIG.logMax;
+    saveState();
+    renderPanel();
+  }
+
+  function fmtDur(sec) {
+  if (!isFinite(sec) || sec <= 0) return 'まもなく';
+  if (sec < 90) return '約' + Math.max(1, Math.round(sec)) + '秒';
+  if (sec < 3600) return '約' + Math.round(sec / 60) + '分';
+  if (sec < 86400) {
+    var h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+    return '約' + h + '時間' + (m ? m + '分' : '');
+  }
+  return '約' + (sec / 86400).toFixed(1) + '日';
+}
+
+function fmt(n) {
+    if (n >= 1e15) return (n / 1e15).toFixed(3) + ' Qa';
+    if (n >= 1e12) return (n / 1e12).toFixed(3) + ' T';
+    if (n >= 1e9) return (n / 1e9).toFixed(3) + ' B';
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + ' M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + ' K';
+    return '' + Math.floor(n);
+  }
+
+  /* ---------------- ゲーム状態の読み取り ---------------- */
+
+  function gameReady() {
+    return typeof W.Game !== 'undefined' && W.Game && W.Game.Objects && W.Game.ready;
+  }
+
+  var challengeCache = { at: 0, value: false };
+  function isChallengePage() {
+    // innerText の取得は重いので、判定結果を5秒キャッシュする
+    var now = Date.now();
+    if (now - challengeCache.at < 5000) return challengeCache.value;
+    var v = false;
+    try {
+      var t = (document.title || '') + ' ' + (document.body ? document.body.innerText.slice(0, 400) : '');
+      v = /just a moment|performing security verification|verify you are human/i.test(t);
+    } catch (e) { v = false; }
+    challengeCache = { at: now, value: v };
+    return v;
+  }
+
+  // バフで膨らんでいない素のCpS（建物合計×全体倍率で近似）
+  function baseCps() {
+    // バフなしCpSを優先する（Frenzy等の一次バフで判断を膨らませない）
+    var G = W.Game;
+    try {
+      if (typeof G.unbuffedCps === 'number' && G.unbuffedCps > 0) return G.unbuffedCps;
+      if (typeof G.unbuffedCookiesPs === 'number' && G.unbuffedCookiesPs > 0) return G.unbuffedCookiesPs;
+      var sum = 0;
+      for (var k in G.Objects) { sum += G.Objects[k].storedTotalCps || 0; }
+      var mult = (typeof G.globalCpsMult === 'number' && G.globalCpsMult > 0) ? G.globalCpsMult : 1;
+      var v = sum * mult;
+      return v > 0 ? v : (G.cookiesPs || 0);
+    } catch (e) { return G.cookiesPs || 0; }
+  }
+
+  function unitCpsOf(obj) {
+    // 建物1軒あたりの増産量。再計算済みの storedCps（建物レベル補正込み）を優先する
+    try {
+      if (typeof obj.storedCps === 'number' && isFinite(obj.storedCps) && obj.storedCps > 0) return obj.storedCps;
+      if (typeof obj.cps === 'function') {
+        var v = obj.cps(obj);
+        if (typeof v === 'number' && isFinite(v) && v > 0) return v;
+      }
+    } catch (e) { /* fallthrough */ }
+    return obj.storedCps || 0;
+  }
+
+  function buildingPrice(obj) {
+    try { return (typeof obj.getPrice === 'function') ? obj.getPrice() : obj.price; }
+    catch (e) { return obj.price; }
+  }
+
+  function holoboreState() {
+    // 'slotted'（配置中）/ 'none'（未配置で確定）/ 'unknown'（判定不能）の3状態。
+    // 'none' のときだけ黄金クッキーをクリックしてよい。
+    try {
+      if (typeof W.Game.hasGod === 'function') {
+        var r = W.Game.hasGod('asceticism');
+        return (r !== false && r !== -1 && r !== undefined && r !== null) ? 'slotted' : 'none';
+      }
+    } catch (e) { /* fallthrough */ }
+    try {
+      var t = W.Game.Objects['Temple'];
+      if (t && (t.level || 0) >= 1) return 'unknown'; // パンテオンがあるはずなのに読めない
+    } catch (e) { return 'unknown'; }
+    return 'none'; // パンテオン未解放なら配置のしようがない
+  }
+
+  /* ---------------- 購入候補の評価 ---------------- */
+
+  function isBlockedUpgrade(up) {
+    var name = (up.name || '').toLowerCase();
+    for (var i = 0; i < BLOCKED_UPGRADE_WORDS.length; i++) {
+      if (name.indexOf(BLOCKED_UPGRADE_WORDS[i]) >= 0) return true;
+    }
+    return false;
+  }
+
+  // 候補リストを作る。各候補: {kind, ref, label, price, gain, payback}
+  function achievementCount() {
+    var n = 0;
+    try { for (var k in W.Game.Achievements) { if (W.Game.Achievements[k].won) n++; } } catch (e) { /* ignore */ }
+    return n;
+  }
+
+  // 全体系の評価対象は「純粋な倍率系」だけに限定する（ホワイトリスト方式）。
+  // 卵・研究・天上系など特殊な仕組みを持つものは、名前でも明示的に弾く（二重の安全）。
+  function isGlobalWhitelisted(up) {
+    var pool = '';
+    try { pool = up.pool || ''; } catch (e) { pool = ''; }
+    if (pool === 'tech' || pool === 'toggle' || pool === 'prestige' || pool === 'debug') return false;
+    var n = (up.name || '').toLowerCase();
+    if (/egg|research|heavenly|permanent|pledge|covenant|pact/.test(n)) return false;
+    if (pool === 'cookie') return true;                   // フレーバークッキー（全体％系）
+    if (/kitten/.test(n)) return true;                    // 子猫系
+    if (/mouse|finger|ambidextrous/.test(n)) return true; // マウス・指系（クリック値）
+    if (/cookies?$/.test(n)) return true;                 // 全体％クッキー系（〜 cookie / 〜 cookies）
+    return false;
+  }
+
+  // 全体系アップグレード（子猫・全体％・指/マウス系）の効果を、ゲーム本体の再計算で実測する。
+  // bought を一時的に立てて CalculateGains し、元の値へ復元する。復元後は
+  // CpS・クリック値・所持金・実績数・所有数・過去最高CpS記録が元通りか照合し、
+  // 1つでも合わなければ、このセッションではシミュレーション自体を止める。
+  var simDisabled = gmGet('ccauto_simDisabled', 0) === 1; // 一度止めたら再読み込みしても戻さない
+  var upGainCache = {}; // name -> {dcps, dclick, at, ach, cps, bOwned, uOwned}
+  function simulatedUpgradeGain(up, cpsNow) {
+    if (simDisabled) return 0;
+    var name = up.name;
+    var now = Date.now();
+    var ach = achievementCount();
+    var bOwned = 0, uOwned = 0;
+    try { bOwned = W.Game.BuildingsOwned || 0; uOwned = W.Game.UpgradesOwned || 0; } catch (e) { /* ignore */ }
+    var c = upGainCache[name];
+    if (c && c.ach === ach && c.bOwned === bOwned && c.uOwned === uOwned &&
+        (now - c.at) < 60000 && c.cps > 0 && Math.abs(cpsNow - c.cps) / c.cps < 0.2) {
+      return c.dcps + c.dclick * measuredClickRate();
+    }
+    var dcps = 0, dclick = 0;
+    try {
+      var G = W.Game;
+      var cps0 = baseCps(), click0 = mouseCps();
+      var bank0 = G.cookies, ach0 = ach, uOwned0 = uOwned;
+      var origBought = up.bought;
+      var highest0 = (typeof G.cookiesPsRawHighest === 'number') ? G.cookiesPsRawHighest : null;
+      var failed = false;
+      up.bought = 1;
+      try {
+        G.CalculateGains();
+        dcps = Math.max(0, baseCps() - cps0);
+        dclick = Math.max(0, mouseCps() - click0);
+      } catch (e1) { failed = true; }
+      try {
+        up.bought = origBought;
+        G.CalculateGains();
+      } catch (e2) { failed = true; } // 復元側の例外は握りつぶさず失敗として扱う
+      // 過去最高CpSの記録は再計算で膨らむことがあるため、元の値に戻す
+      if (highest0 !== null) { try { G.cookiesPsRawHighest = highest0; } catch (e3) { /* ignore */ } }
+      if (!failed) {
+        try {
+          var tol = Math.max(1, cps0 * 0.001);
+          if (up.bought !== origBought ||
+              Math.abs(baseCps() - cps0) > tol ||
+              Math.abs(mouseCps() - click0) > Math.max(0.01, click0 * 0.001) ||
+              (highest0 !== null && G.cookiesPsRawHighest !== highest0) ||
+              G.cookies !== bank0 || achievementCount() !== ach0 ||
+              (G.UpgradesOwned || 0) !== uOwned0) {
+            failed = true;
+          }
+        } catch (e4) { failed = true; }
+      }
+      if (failed) {
+        // 測定方法だけを止め、購入自体は止めない（方針: 止まるのが一番の非効率。異常は報告する）
+        simDisabled = true;
+        gmSet('ccauto_simDisabled', 1);
+        upGainCache = {};
+        dcps = 0; dclick = 0;
+        reportError('全体系の効果測定で状態の不一致を検知したため、この測定方法だけを停止しました（購入は継続します）');
+      }
+    } catch (e) { dcps = 0; dclick = 0; }
+    upGainCache[name] = { dcps: dcps, dclick: dclick, at: now, ach: ach, cps: cpsNow, bOwned: bOwned, uOwned: uOwned };
+    return dcps + dclick * measuredClickRate();
+  }
+
+  // 建物も、1軒増やした状態でゲーム本体に再計算させて「全体の増産」を実測する。
+  // 建物同士の相乗効果（他の建物の生産が一緒に増える分）まで含めた正確な増産が得られる。
+  // 復元できなければ、この測定方法だけを止めて近似計算に切り替える（購入は止めない）。
+  var bSimDisabled = gmGet('ccauto_bSimDisabled', 0) === 1;
+  // 建物ごとの測定停止（不一致が続く建物だけを止め、他の建物の実測は続ける）
+  var bSimOff = {};
+  try { bSimOff = JSON.parse(gmGet('ccauto_bSimOff', '{}') || '{}') || {}; } catch (e) { bSimOff = {}; }
+  var bSimFailsBy = {}; // name -> その建物で不一致が連続した回数
+  var bGainCache = {}; // name -> {gain, at, ach, cps, bOwned, uOwned}
+  function simulatedBuildingGain(obj, cpsNow) {
+    var name = obj.name;
+    if (bSimDisabled || bSimOff[name]) return 0;
+    var now = Date.now();
+    var ach = achievementCount();
+    var bOwned = 0, uOwned = 0;
+    try { bOwned = W.Game.BuildingsOwned || 0; uOwned = W.Game.UpgradesOwned || 0; } catch (e) { /* ignore */ }
+    var c = bGainCache[name];
+    if (c && c.ach === ach && c.bOwned === bOwned && c.uOwned === uOwned &&
+        (now - c.at) < 60000 && c.cps > 0 && Math.abs(cpsNow - c.cps) / c.cps < 0.2) {
+      return c.gain;
+    }
+    var gain = 0;
+    try {
+      var G = W.Game;
+      var bank0 = G.cookies, ach0 = ach, bOwned0 = bOwned;
+      var amt0 = obj.amount || 0;
+      var highest0 = (typeof G.cookiesPsRawHighest === 'number') ? G.cookiesPsRawHighest : null;
+      // 増産は「全建物の生産合計（storedTotalCps）の増え方」で測る。
+      // 再計算（CalculateGains）が必ず更新する値だけを使うので、メインループ側で管理される値
+      // （unbuffedCps や computedMouseCps）の更新タイミングに左右されない。
+      // 他の建物の生産が一緒に増える分（相乗効果）も、合計の増え方にそのまま含まれる。
+      var storedSum = function () {
+        var sm = 0;
+        try { for (var k in G.Objects) sm += G.Objects[k].storedTotalCps || 0; } catch (e) { /* ignore */ }
+        return sm;
+      };
+      var sum0 = storedSum();
+      var failed = false, wild = false;
+      obj.amount = amt0 + 1;
+      try {
+        G.CalculateGains();
+        gain = Math.max(0, storedSum() - sum0);
+        // あり得ない大きさの増え方は測定が乱れたものとして捨てる（判断に使わない）
+        var unit0 = 0;
+        try { unit0 = unitCpsOf(obj) || 0; } catch (e6) { unit0 = 0; }
+        if (gain > Math.max(sum0 * 0.25, unit0 * 30)) wild = true;
+      } catch (e1) { failed = true; }
+      try { obj.amount = amt0; G.CalculateGains(); } catch (e2) { failed = true; }
+      if (highest0 !== null) { try { G.cookiesPsRawHighest = highest0; } catch (e3) { /* ignore */ } }
+      // 派生カウンタ（所有建物数）は再計算だけでは元に戻らないことがあるため、手で元の値へ戻す
+      try { if ((G.BuildingsOwned || 0) !== bOwned0) G.BuildingsOwned = bOwned0; } catch (e5) { /* ignore */ }
+      // どの項目が一致しなかったかを記録する（原因の切り分け用に報告へ含める）
+      var badFields = [];
+      if (!failed) {
+        try {
+          var tolS = Math.max(0.001, sum0 * 0.0001);
+          if ((obj.amount || 0) !== amt0) badFields.push('amount');
+          if (Math.abs(storedSum() - sum0) > tolS) badFields.push('storedCps');
+          if (G.cookies !== bank0) badFields.push('cookies');
+          // 実績が「増えた」場合は、測定中に正当に解放されたものとして失敗扱いにしない（どのみち次に買えば解放される）
+          if (achievementCount() < ach0) badFields.push('achievements');
+          if ((G.BuildingsOwned || 0) !== bOwned0) badFields.push('buildingsOwned');
+        } catch (e4) { badFields.push('exception'); }
+      }
+      if (failed || wild || badFields.length) {
+        bSimFailsBy[name] = (bSimFailsBy[name] || 0) + 1;
+        gain = 0;
+        var parts = badFields.slice();
+        if (wild) parts.push('wild');
+        if (!parts.length) parts.push('exception');
+        var badTxt = parts.join(',');
+        if (bSimFailsBy[name] >= 2) {
+          bSimOff[name] = 1;
+          try { gmSet('ccauto_bSimOff', JSON.stringify(bSimOff)); } catch (e7) { /* ignore */ }
+          delete bGainCache[name];
+          reportError('建物の効果測定で状態の不一致が続いたため、この建物の測定だけを停止しました（対象: ' + name + '、不一致: ' + badTxt + '、他の建物の測定と購入は継続します）');
+        } else {
+          reportError('建物の効果測定で状態の不一致を検知しました（対象: ' + name + '、不一致: ' + badTxt + '）。もう一度続くようなら、この建物の測定を停止します（購入は継続します）');
+        }
+      } else {
+        bSimFailsBy[name] = 0;
+      }
+    } catch (e) { gain = 0; }
+    bGainCache[name] = { gain: gain, at: now, ach: ach, cps: cpsNow, bOwned: bOwned, uOwned: uOwned };
+    return gain;
+  }
+
+  // 建物1軒の増産: 実測できれば実測値、できなければ従来の近似（単体生産×全体倍率×クリック押し上げ）
+  function buildingGainOf(obj, cpsNow, gMult, clickBoost) {
+    var sim = simulatedBuildingGain(obj, cpsNow);
+    if (sim > 0) return sim * gMult * clickBoost;
+    return unitCpsOf(obj) * gMult * clickBoost;
+  }
+
+  function evaluateCandidates() {
+    var G = W.Game;
+    var out = [];
+    var cpsNow = baseCps();
+    // 建物系の増産（全体倍率の適用前）と全体系の増産（適用後の実測）を同じ物差しに揃えるため、
+    // 現在効いている全体倍率（バフなしCpS ÷ 建物生産の単純合計）を建物系の gain に掛ける
+    var rawSum = 0;
+    try { for (var rk in G.Objects) { rawSum += G.Objects[rk].storedTotalCps || 0; } } catch (e) { rawSum = 0; }
+    // 特殊な卵（"egg"）は建物合計に含まれない固定+9 CpSを持つため、分母に足して倍率を正す
+    var flatCps = 0;
+    try { if (G.Has && (G.Has('egg') || G.Has('"egg"'))) flatCps = 9; } catch (e) { flatCps = 0; }
+    var gMult = (rawSum + flatCps) > 0 ? cpsNow / (rawSum + flatCps) : 1;
+    if (!(gMult > 0) || !isFinite(gMult)) gMult = 1;
+    // マウス系強化（1クリックにCpSの1%ずつ）は建物系の増産でクリック収入も押し上げるため、その分を gain に含める
+    var mouseOwned = 0;
+    try { for (var mk in G.Upgrades) { if (G.Upgrades[mk].bought && /mouse/i.test(mk)) mouseOwned++; } } catch (e) { mouseOwned = 0; }
+    try { var f104 = G.Upgrades['Fortune #104']; if (f104 && f104.bought) mouseOwned++; } catch (e) { /* ignore */ } // Fortune #104 も同じ+1%
+    var clickBoost = 1 + mouseOwned * 0.01 * measuredClickRate();
+
+    // 建物
+    for (var key in G.Objects) {
+      var obj = G.Objects[key];
+      if (!obj || obj.locked) continue;
+      var gain = buildingGainOf(obj, cpsNow, gMult, clickBoost);
+      if (!(gain > 0)) continue;
+      var price = buildingPrice(obj);
+      var nextCount = (obj.amount || 0) + 1;
+      out.push({
+        kind: 'building', ref: obj, label: obj.name + '（' + nextCount + '軒目）',
+        price: price, gain: gain, payback: price / gain
+      });
+    }
+
+    // アップグレード（店頭にあるものだけ。建物ひも付き倍率系＋全体系を自動購入する）
+    var store = G.UpgradesInStore || [];
+    for (var i = 0; i < store.length; i++) {
+      var up = store[i];
+      if (!up || up.bought) continue;
+      if (isBlockedUpgrade(up)) continue;
+      var tie = up.buildingTie1 || null;
+      if (up.buildingTie2) continue; // シナジーは計算式が別（所有数比例）なので、過大評価を避けて対象外
+      if (!tie) {
+        // 全体系はホワイトリスト（純粋な倍率系）だけを、ゲーム本体の再計算で実測して評価する
+        if (!isGlobalWhitelisted(up)) continue;
+        var gGain = simulatedUpgradeGain(up, cpsNow);
+        if (!(gGain > 0)) continue; // CpS・クリック値に効かないもの（研究解放など）は買わない
+        var gPrice = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice;
+        out.push({
+          kind: 'upgrade', ref: up, label: up.name,
+          price: gPrice, gain: gGain, payback: gPrice / gGain
+        });
+        continue;
+      }
+      if (typeof up.tier !== 'number') continue; // ティア（×2）強化だけを対象にする（指系などは効果が異なる）
+      // 倍率アップグレードも、買った状態で再計算して全体の増産を実測する（相乗効果込み）。測れない場合は従来の近似に切り替える
+      var tiedTotal = simulatedUpgradeGain(up, cpsNow);
+      if (!(tiedTotal > 0)) tiedTotal = (tie.storedTotalCps || 0) * gMult * clickBoost;
+      if (!(tiedTotal > 0)) continue;
+      var uPrice = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice;
+      out.push({
+        kind: 'upgrade', ref: up, label: up.name,
+        price: uPrice, gain: tiedTotal, payback: uPrice / tiedTotal
+      });
+    }
+
+    // 先読み: まだ解放されていない「建物×2」ティア強化を、
+    // 解放に必要な軒数分の建物とセットで評価する（ショップに出る前に予想する）
+    var TIERS = [1, 5, 25, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600];
+    var lockedByBuilding = {};
+    for (var uname in G.Upgrades) {
+      var lu = G.Upgrades[uname];
+      if (!lu || lu.bought || lu.unlocked) continue;
+      if (isBlockedUpgrade(lu)) continue;
+      var lt = null;
+      try { lt = lu.buildingTie1 || null; } catch (e) { lt = null; }
+      if (!lt || !lt.name) continue;
+      if (typeof lu.tier !== 'number' || lu.tier < 1) continue; // ティア強化だけを対象にする
+      if (!lockedByBuilding[lt.name]) lockedByBuilding[lt.name] = [];
+      lockedByBuilding[lt.name].push(lu);
+    }
+    for (var bkey in G.Objects) {
+      var bobj = G.Objects[bkey];
+      if (!bobj || bobj.locked) continue;
+      var amt = bobj.amount || 0;
+      if (amt < 1) continue;
+      var ups = lockedByBuilding[bobj.name];
+      if (!ups || !ups.length) {
+        // 建物側にティア強化の一覧がある場合はそちらも使う
+        ups = [];
+        try {
+          if (bobj.tieredUpgrades) {
+            for (var tk in bobj.tieredUpgrades) {
+              var tu = bobj.tieredUpgrades[tk];
+              if (tu && typeof tu === 'object' && !tu.bought && !tu.unlocked) ups.push(tu);
+            }
+          }
+        } catch (e) { ups = []; }
+        if (!ups.length) continue;
+      }
+      ups.sort(function (a, b) {
+        var ta = (typeof a.tier === 'number') ? a.tier : 999;
+        var tb = (typeof b.tier === 'number') ? b.tier : 999;
+        if (ta !== tb) return ta - tb;
+        return (a.basePrice || 0) - (b.basePrice || 0);
+      });
+      var nextUp = ups[0];
+      var threshold = 0;
+      // 解放軒数はゲーム内部の定義（Game.Tiers）を最優先で参照する
+      try {
+        var gt = (G.Tiers && typeof nextUp.tier === 'number') ? G.Tiers[nextUp.tier] : null;
+        if (gt && typeof gt.unlock === 'number') threshold = gt.unlock;
+      } catch (e) { threshold = 0; }
+      if (!threshold && typeof nextUp.tier === 'number' && nextUp.tier >= 1 && nextUp.tier <= TIERS.length) {
+        threshold = TIERS[nextUp.tier - 1];
+      }
+      if (!threshold) {
+        for (var ti = 0; ti < TIERS.length; ti++) { if (TIERS[ti] > amt) { threshold = TIERS[ti]; break; } }
+      }
+      if (!threshold || threshold <= amt) continue;
+      var need = threshold - amt;
+      if (need > 100) continue;
+      var simUnit = buildingGainOf(bobj, cpsNow, gMult, clickBoost);
+      if (!(simUnit > 0)) continue;
+      var unitPrice = buildingPrice(bobj);
+      var setPrice = unitPrice * (Math.pow(1.15, need) - 1) / 0.15 +
+        ((typeof nextUp.getPrice === 'function') ? nextUp.getPrice() : (nextUp.basePrice || 0));
+      // セット完成後のその建物の寄与は (amt+need) 軒×2倍。現在は amt 軒ぶん
+      var setGain = ((amt + need) * 2 - amt) * simUnit;
+      if (!(setGain > 0)) continue;
+      out.push({
+        kind: 'set', ref: nextUp, buildingRef: bobj,
+        label: bobj.name + ' ' + threshold + '軒セット（倍強化込み）',
+        price: setPrice, gain: setGain, payback: setPrice / setGain,
+        setAmt: amt, setNeed: threshold // セット目標の達成率は軒数ベースで計算する
+      });
+    }
+
+    out.sort(function (a, b) { return a.payback - b.payback; });
+    return { list: out, cpsNow: cpsNow, gMult: gMult, clickBoost: clickBoost };
+  }
+
+  /* ---------------- 購入の実行 ---------------- */
+
+  function doBuy(cand, quiet) {
+    var G = W.Game;
+    var bankBefore = G.cookies;
+    var cpsBefore = 0;
+    try { cpsBefore = baseCps(); } catch (e) { /* ignore */ }
+    var clickBefore = 0;
+    try { clickBefore = mouseCps(); } catch (e) { /* ignore */ }
+    try {
+      if (cand.kind === 'building') {
+        var before = cand.ref.amount;
+        cand.ref.buy(1);
+        if (cand.ref.amount > before) {
+          upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
+          state.pendingVerify = { label: cand.label, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature() };
+          gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
+          if (!quiet) {
+            log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
+            reportStep();
+          }
+          return true;
+        }
+      } else {
+        cand.ref.buy();
+        if (cand.ref.bought) {
+          upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
+          state.pendingVerify = { label: cand.label, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature() };
+          gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
+          if (!quiet) {
+            log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
+            reportStep();
+          }
+          return true;
+        }
+      }
+    } catch (e) { /* 失敗しても次周期で再評価 */ }
+    if (G.cookies < bankBefore - cand.price * 1.5) {
+      // 想定外の支出があったら記録だけ残す
+      log('注意: 購入検証に失敗（' + cand.label + '）');
+    }
+    return false;
+  }
+
+  // 実際にゲームへ登録されたクリック速度の実測（直近30秒のクリック数の伸びから算出）
+  var clickSamples = [];
+  function sampleClicks() {
+    try {
+      if (!gameReady()) return;
+      var now = Date.now();
+      clickSamples.push([now, W.Game.cookieClicks || 0]);
+      while (clickSamples.length > 2 && now - clickSamples[0][0] > 30000) clickSamples.shift();
+    } catch (e) { /* ignore */ }
+  }
+  function measuredClickRate() {
+    // 実測が十分に溜まるまでは設定値で代用する（起動直後の数十秒だけ）
+    if (clickSamples.length >= 2) {
+      var first = clickSamples[0], last = clickSamples[clickSamples.length - 1];
+      var dt = (last[0] - first[0]) / 1000;
+      if (dt >= 3) return Math.max(0, (last[1] - first[1]) / dt);
+    }
+    return clickRate();
+  }
+
+  function totalIncome(cpsNow) {
+    // 生産（CpS）＋クリック収入の合計。クリックは設定値ではなく実測の登録速度で見積もる
+    return cpsNow + measuredClickRate() * mouseCps();
+  }
+
+  // 第1目標・第2目標の達成率。通常は所持÷価格、セット目標は軒数ベース（現在÷必要軒数）
+  function goalPctOf(cand, bank) {
+    if (!cand) return 0;
+    if (cand.kind === 'set' && cand.setNeed > 0) {
+      return Math.min(100, Math.floor((cand.setAmt || 0) / cand.setNeed * 100));
+    }
+    if (!(cand.price > 0)) return 0;
+    return Math.min(100, Math.floor(bank / cand.price * 100));
+  }
+
+  function goalInfo(cand, bank, inc) {
+    if (!cand) return null;
+    var eta = (inc > 0 && cand.price > bank) ? Math.round((cand.price - bank) / inc) : 0;
+    var info = { label: cand.label, price: Math.round(cand.price), pct: goalPctOf(cand, bank), etaSec: eta, kind: cand.kind, active: false };
+    if (cand.kind === 'set') { info.setAmt = cand.setAmt || 0; info.setNeed = cand.setNeed || 0; if (cand.buildingRef) info.building = cand.buildingRef.name; }
+    return info;
+  }
+
+  // 第1目標（効率1位）と第2目標（その間に実際に買うもの。貯金中は null）の表示状態をそろえる
+  function setGoals(top, second, active, saving, bank, inc) {
+    state.goal1 = goalInfo(top, bank, inc);
+    state.goal2 = goalInfo(second, bank, inc);
+    state.goalActive = active;
+    state.goalSaving = !!saving;
+    if (state.goal1) state.goal1.active = active === 1;
+    if (state.goal2) state.goal2.active = active === 2;
+  }
+
+  function setSaveTarget(top, cpsNow, saving) {
+    var inc = totalIncome(cpsNow);
+    var bank = W.Game.cookies;
+    state.nextTarget = top.label;
+    state.nextDetail = (saving ? '貯金中、あと ' : '目標、あと ') + fmt(top.price - bank) +
+      (inc > 0 ? '、' + fmtDur((top.price - bank) / inc) : '');
+    state.targetPrice = top.price;
+  }
+
+  function buyStep() {
+    if (!state.running || state.mode !== 'auto') return;
+    if (!gameReady() || isChallengePage()) return;
+    // 前回購入の実測検証（ゲーム側の再計算が済んだこのタイミングで照合する）
+    if (state.pendingVerify) {
+      var pv = state.pendingVerify;
+      // 全体系の gain にはクリック値の増分（実測速度で換算）が含まれるため、検証も同じ物差しで照合する
+      var measured = null;
+      try {
+        measured = (baseCps() - pv.cpsBefore) +
+          Math.max(0, mouseCps() - (pv.clickBefore || 0)) * measuredClickRate();
+      } catch (e) { measured = null; }
+      // 検証の計算が最後まで済んでから記録を消す（途中で例外が出たら未検証として停止する）
+      state.pendingVerify = null;
+      gmSet('ccauto_pendingVerify', '');
+      if (measured === null) {
+        reportError('購入後の検証でエラーが出ました（購入は継続します）');
+      } else if (pv.gain > 0) {
+        // 購入と検証のあいだにゴールデンクッキー等の効果が始まった/終わった場合は、測定が信用できないため判定しない
+        var buffChanged = pv.buffs != null && buffSignature() !== pv.buffs;
+        var tooLow = !buffChanged && measured < pv.gain * 0.5;
+        // 増えすぎ側は、予測に入らない相乗効果などで普通に起こるため、本当に極端な場合だけ報告する
+        var tooHigh = !buffChanged && measured > pv.gain * 10 + pv.cpsBefore * 0.05;
+        // 購入で実績が増えた場合、ミルク経由の伸びは予測に入らないため、過大側は異常扱いしない
+        if (tooHigh && pv.achBefore != null && achievementsWon() > pv.achBefore) tooHigh = false;
+        if (tooLow || tooHigh) {
+          state.anomalies = (state.anomalies || 0) + 1;
+          reportError('購入後の増産が予測と大きく違います（' + pv.label + '、予測 ' + fmt(Math.round(pv.gain)) + ' → 実測 ' + fmt(Math.round(measured)) + '、購入は継続します）');
+        } else {
+          state.anomalies = 0;
+        }
+      } else {
+        state.anomalies = 0;
+      }
+    }
+    if (state.halted) { renderPanel(); return; }
+    var G = W.Game;
+    var boughtCounts = {};
+    var boughtTotal = 0;
+    // 1回の判断で、回収効率を毎回判定し直しながら最大 maxBatch 個までまとめ買いする
+    for (var step = 0; step < CONFIG.maxBatch; step++) {
+      var ev = evaluateCandidates();
+      if (state.halted) break; // 評価中に異常停止が立ったら、その回の候補では買わない
+      if (!ev.list.length) break;
+      var bank = G.cookies;
+      var top = ev.list[0];
+      var pick = null;
+      if (top.price <= bank) {
+        pick = top; // 効率1位が買えるなら、それを買う
+      } else {
+        // 効率1位Aが買えない間は、買える候補Bそれぞれについて「A→B」と「B→A」の
+        // 両方が揃うまでの時間を比べ、Bを先に買う方が速い場合だけBを買う。
+        // それ以外はAのために貯金する（固定の貯金時間ルールは v2.0 で廃止）
+        var R = totalIncome(ev.cpsNow);
+        var bestB = null, bestTBA = Infinity;
+        if (R > 0 && top.gain > 0) {
+          var tA = (top.price - bank) / R;
+          for (var ci = 1; ci < ev.list.length; ci++) {
+            var B = ev.list[ci];
+            if (B.price > bank || !(B.gain > 0)) continue;
+            // Aがセットの場合、その建物を買うことはセット自体を進めることなので常に対象にする
+            if (top.kind === 'set' && B.kind === 'building' && top.buildingRef && B.ref === top.buildingRef) { bestB = B; bestTBA = 0; break; }
+            var tAB = tA + B.price / (R + top.gain); // Aを買った直後の残高は0として計算する
+            var tBA = (top.price - (bank - B.price)) / (R + B.gain);
+            if (tBA < tAB && tBA < bestTBA) { bestB = B; bestTBA = tBA; }
+          }
+        }
+        if (bestB) {
+          pick = bestB;
+        } else {
+          if (boughtTotal === 0) { setSaveTarget(top, ev.cpsNow, true); state.goalTarget = ''; state.goalDetail = ''; setGoals(top, null, 1, true, bank, totalIncome(ev.cpsNow)); }
+          break;
+        }
+      }
+      state.nextTarget = pick.label;
+      state.nextDetail = (pick.kind === 'set') ? '倍強化まで買い進め中' : '';
+      state.targetPrice = 0;
+      // 効率1位が別のものなら、「目標」として分けて表示する
+      if (top.label !== pick.label) {
+        var incP = totalIncome(ev.cpsNow);
+        state.goalTarget = top.label;
+        state.goalDetail = 'あと ' + fmt(top.price - bank) + (incP > 0 ? '、' + fmtDur((top.price - bank) / incP) : '');
+      } else { state.goalTarget = ''; state.goalDetail = ''; }
+      // 第1目標・第2目標の表示状態もそろえる
+      var incG = totalIncome(ev.cpsNow);
+      if (pick === top) setGoals(top, ev.list[1] || null, 1, false, bank, incG);
+      else setGoals(top, pick, 2, false, bank, incG);
+      var bankB = G.cookies;
+      var buyCand = pick;
+      var countKey = pick.label;
+      if (pick.kind === 'set') {
+        var bRef = pick.buildingRef;
+        buyCand = { kind: 'building', ref: bRef, label: bRef.name, price: buildingPrice(bRef), gain: buildingGainOf(bRef, ev.cpsNow, ev.gMult || 1, ev.clickBoost || 1) };
+        countKey = bRef.name;
+      } else if (pick.kind === 'building') {
+        countKey = pick.ref.name;
+      }
+      if (!doBuy(buyCand, true)) break;
+      boughtTotal++;
+      if (!boughtCounts[countKey]) boughtCounts[countKey] = { n: 0, spent: 0 };
+      boughtCounts[countKey].n++;
+      boughtCounts[countKey].spent += Math.max(0, bankB - G.cookies);
+    }
+    if (boughtTotal > 0) {
+      var parts = [];
+      for (var k in boughtCounts) {
+        parts.push(k + (boughtCounts[k].n > 1 ? ' ×' + boughtCounts[k].n : '') + '（' + fmt(boughtCounts[k].spent) + '）');
+      }
+      log('購入: ' + parts.join(' / '));
+      reportStep();
+    }
+    renderPanel();
+  }
+
+  /* ---------------- クリック ---------------- */
+
+  function clickRate() {
+    var v = parseFloat(gmGet('ccauto_clickRate', ''));
+    if (isNaN(v)) v = CONFIG.clickPerSecond;
+    if (v < 0) v = 0;
+    if (v > 250) v = 250; // ゲーム側のクリック計数上限が約250/秒のため
+    return v;
+  }
+
+  var clickTimer = null;
+  function scheduleClicks() {
+    if (clickTimer) { clearInterval(clickTimer); clickTimer = null; }
+    if (clickRate() <= 0) return;
+    clickTimer = setInterval(clickStep, 50);
+  }
+
+  var clickAcc = 0;
+  function mouseCps() {
+    try { return W.Game.computedMouseCps || 0; } catch (e) { return 0; }
+  }
+
+  function clickStep() {
+    if (!state.running) return;
+    if (!gameReady() || isChallengePage()) return;
+    var r = clickRate();
+    if (r <= 0) return;
+    clickAcc += r / 20; // 50msごとに rate/20 回ぶんをまとめてクリック
+    var n = Math.floor(clickAcc);
+    clickAcc -= n;
+    for (var i = 0; i < n; i++) {
+      try { W.Game.ClickCookie(); } catch (e) { break; }
+    }
+  }
+
+  function goldenStep() {
+    if (!state.running || !CONFIG.clickGolden) return;
+    if (!gameReady() || isChallengePage()) return;
+    // ホロボア配置中・判定不能のときは黄金クッキーを触らない
+    if (holoboreState() !== 'none') return;
+    try {
+      var shimmers = W.Game.shimmers || [];
+      for (var i = 0; i < shimmers.length; i++) {
+        var s = shimmers[i];
+        if (s.type === 'golden' && !s.wrath) {
+          s.pop();
+          log('黄金クッキーをクリック');
+          setTimeout(function () {
+            try {
+              var names = Object.keys(W.Game.buffs || {});
+              if (names.length) log('効果: ' + names.join(', '));
+            } catch (e) { /* ignore */ }
+          }, 500);
+        }
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  /* ---------------- セーブの書き出し ---------------- */
+
+  function exportSave(manual) {
+    if (!gameReady()) { if (manual) log('バックアップ失敗: ゲーム未準備'); return; }
+    try {
+      var code = W.Game.WriteSave(1);
+      if (!code || typeof code !== 'string' || code.length < 20) {
+        if (manual) log('バックアップ失敗: コードが取得できませんでした');
+        return;
+      }
+      var d = new Date();
+      function p(n) { return (n < 10 ? '0' : '') + n; }
+      var fname = 'cookie-save-' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + '.txt';
+      var blob = new Blob([code], { type: 'text/plain' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = fname;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+      gmSet('ccauto_lastBackup', Date.now());
+      log('セーブを書き出しました: ' + fname);
+    } catch (e) {
+      if (manual) log('バックアップ失敗: ' + e);
+    }
+  }
+
+  /* ---------------- 状態の送信（Muse側で見るため） ---------------- */
+
+  function collectStatus() {
+    var G = W.Game;
+    var buildings = [];
+    for (var k in G.Objects) {
+      var o = G.Objects[k];
+      buildings.push({
+        name: o.name, count: o.amount || 0,
+        unitCps: Math.round(o.storedCps || 0), totalCps: Math.round(o.storedTotalCps || 0),
+        nextPrice: Math.round(buildingPrice(o) || 0)
+      });
+    }
+    var ach = 0;
+    for (var ai in G.Achievements) { if (G.Achievements[ai].won) ach++; }
+    var ups = [];
+    for (var ui in G.Upgrades) { if (G.Upgrades[ui].bought) ups.push(G.Upgrades[ui].name); }
+    var status = {
+      v: 1, ts: Date.now(), source: 'galaxy-tab',
+      bank: Math.floor(G.cookies), cps: Math.round(baseCps()), cpsRaw: Math.round(G.cookiesPs || 0),
+      totalEarned: Math.floor(G.cookiesEarned || 0),
+      clicks: G.cookieClicks || 0, clickValue: Math.round(G.computedMouseCps || 0),
+      achievements: ach, upgradesOwned: ups,
+      buildings: buildings,
+      lumps: (typeof G.lumps === 'number') ? G.lumps : 0,
+      heavenlyChips: (typeof G.heavenlyChips === 'number') ? Math.floor(G.heavenlyChips) : 0,
+      mode: state.mode, running: state.running, lastAction: state.lastAction || ''
+    };
+    status.scriptVersion = SCRIPT_VERSION;
+    try {
+      var evD = evaluateCandidates();
+      var topD = evD.list.length ? evD.list[0] : null;
+      status.diag = {
+        top: topD ? topD.label : '',
+        topPrice: topD ? Math.round(topD.price) : 0,
+        income: Math.round(totalIncome(evD.cpsNow)),
+        target: state.nextTarget || '',
+        goal: state.goalTarget || '',
+        detail: state.nextDetail || '',
+        goalDetail: state.goalDetail || '',
+        goal1: state.goal1 || null,
+        goal2: state.goal2 || null
+      };
+    } catch (e) { /* ignore */ }
+    // エラー記録（新しい順・最大10件）を状態に載せる。Muse側のチェッカーが新しいものをチャットへ報告する
+    try { status.errors = gmGet('ccauto_errors', []); } catch (e) { /* ignore */ }
+    // 30分に1回、セーブコードを状態に同梱する（Drive経由でMuse側に保管される）。
+    // 送信成功が確認できるまで pending として保持し、毎回の送信に同梱し続ける
+    try {
+      var pendingSave = gmGet('ccauto_pendingSave', '');
+      if (!pendingSave && Date.now() - gmGet('ccauto_lastSaveRep', 0) >= 30 * 60 * 1000) {
+        var sc = W.Game.WriteSave(1);
+        if (sc && typeof sc === 'string' && sc.length >= 20) {
+          pendingSave = sc;
+          gmSet('ccauto_pendingSave', sc);
+        }
+      }
+      if (pendingSave) { status.saveBackup = pendingSave; lastSentSave = pendingSave; }
+    } catch (e) { /* ignore */ }
+    return status;
+  }
+
+  function reportSecret() { return gmGet('ccauto_reportSecret', ''); }
+
+  var lastSentSave = '';
+  var reportInFlight = false;
+  function reportStep() {
+    if (reportInFlight) return; // 通信中は重ねて送らない（受信側での競合・重複を防ぐ）
+    if (!gameReady() || isChallengePage()) return;
+    if (typeof GM_xmlhttpRequest !== 'function') return;
+    var url = gmGet('ccauto_reportUrl', '');
+    if (!url) return; // 送信先URLが未設定なら何もしない（パネルから設定する）
+    if (!reportSecret()) return; // 合言葉が未設定なら送らない（パネルの🔑から設定する）
+    reportInFlight = true;
+    try {
+      lastSentSave = '';
+      var payload = JSON.stringify({ secret: reportSecret(), status: collectStatus() });
+      // このリクエストが送ったセーブは、応答側でローカルに保持して照合する（共有変数経由にしない）
+      var sentSave = lastSentSave;
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: url,
+        headers: { 'Content-Type': 'text/plain' },
+        data: payload,
+        timeout: 20000,
+        onload: function (res) {
+          reportInFlight = false;
+          if (res && res.status === 200 && typeof res.responseText === 'string' && ('' + res.responseText).trim() === 'ok') {
+            state.lastReport = nowTime();
+            gmSet('ccauto_lastReport', state.lastReport);
+            // セーブの同梱が成功して初めて「送信済み」にする（失敗分は pending として次回も送る）
+            if (sentSave && gmGet('ccauto_pendingSave', '') === sentSave) {
+              gmSet('ccauto_pendingSave', '');
+              gmSet('ccauto_lastSaveRep', Date.now());
+            }
+          } else {
+            // 応答が 'ok' でない＝送信先で受け付けられていない。原因切り分けのためログに残す
+            var msg = '送信の応答が異常（' + (res ? res.status : '?') + '）: ' +
+              ((res && res.responseText) ? ('' + res.responseText).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').slice(0, 80) : '');
+            if (state.logs[0] !== msg) log(msg);
+          }
+          renderPanel();
+        },
+        onerror: function () {
+          reportInFlight = false;
+          var msg = '送信に失敗しました（通信エラー）';
+          if (state.logs[0] !== msg) log(msg);
+          renderPanel();
+        },
+        ontimeout: function () {
+          reportInFlight = false;
+          var msg = '送信に失敗しました（時間切れ）';
+          if (state.logs[0] !== msg) log(msg);
+          renderPanel();
+        }
+      });
+    } catch (e) { reportInFlight = false; }
+  }
+
+  function reportTest() {
+    // 送信の切り分け用：各段階の結果をログに残す（通常の送信は無言）
+    if (reportInFlight) { log('通常の送信が通信中です。少し待ってから試してください'); renderPanel(); return; }
+    log('送信テスト開始');
+    var url = gmGet('ccauto_reportUrl', '');
+    log(url ? ('送信先URL: 設定あり（' + url.length + '文字）') : '送信先URL: 未設定です');
+    if (!url) { renderPanel(); return; }
+    log(reportSecret() ? '合言葉: 設定あり' : '合言葉: 未設定です（パネルの🔑から設定してください）');
+    if (!reportSecret()) { renderPanel(); return; }
+    log('送信の部品: ' + (typeof GM_xmlhttpRequest));
+    if (typeof GM_xmlhttpRequest !== 'function') { renderPanel(); return; }
+    var payload;
+    try {
+      payload = JSON.stringify({ secret: reportSecret(), status: collectStatus() });
+      log('状態データ作成: OK（' + payload.length + '文字）');
+    } catch (e) {
+      log('状態データ作成でエラー: ' + ((e && e.message) ? e.message : e));
+      renderPanel(); return;
+    }
+    var done = false;
+    var watchdog = setTimeout(function () {
+      if (!done) { log('応答が返ってきません（送信の仕組みが止まっています）'); renderPanel(); }
+    }, 25000);
+    try {
+      GM_xmlhttpRequest({
+        method: 'POST', url: url,
+        headers: { 'Content-Type': 'text/plain' },
+        data: payload, timeout: 20000,
+        onload: function (res) {
+          done = true; clearTimeout(watchdog);
+          log('応答あり: ' + (res ? res.status : '?') + ' / ' +
+            ((res && res.responseText) ? ('' + res.responseText).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').slice(0, 60) : ''));
+          if (res && typeof res.responseText === 'string' && ('' + res.responseText).trim() === 'ok') {
+            state.lastReport = nowTime();
+            gmSet('ccauto_lastReport', state.lastReport);
+          }
+          renderPanel();
+        },
+        onerror: function () { done = true; clearTimeout(watchdog); log('通信エラーで失敗しました'); renderPanel(); },
+        ontimeout: function () { done = true; clearTimeout(watchdog); log('時間切れで失敗しました'); renderPanel(); }
+      });
+      log('送信を試しました…');
+    } catch (e) {
+      clearTimeout(watchdog);
+      log('送信の呼び出しでエラー: ' + ((e && e.message) ? e.message : e));
+    }
+    renderPanel();
+  }
+
+  /* ---------------- パネル表示 ---------------- */
+
+  var panel = null;
+  function buildPanel() {
+    if (panel) return;
+    panel = document.createElement('div');
+    panel.id = 'ccauto-panel';
+    panel.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483000;background:rgba(20,16,10,0.92);color:#ffe9b0;' +
+      'font:12px/1.5 sans-serif;padding:8px 10px;border:1px solid #a8842c;border-radius:8px;max-width:270px;';
+    panel.innerHTML =
+      '<style>#ccauto-panel button{background:#3a2c14;color:#ffe9b0;border:1px solid #6b5320;border-radius:6px;padding:5px 7px;font-size:12px;cursor:pointer}#ccauto-panel button:active{background:#57451c}#ccauto-panel .ccauto-rp{padding:2px 5px;font-size:11px}</style>' +
+      '<div id="ccauto-title" style="font-weight:bold;margin-bottom:4px;font-size:13px;">🤖 自動購入パネル</div>' +
+      '<div id="ccauto-status"></div>' +
+      '<div id="ccauto-stats" style="color:#ffe9b0;font-weight:bold;font-size:13px;margin:2px 0;"></div>' +
+      '<div id="ccauto-next" style="margin:2px 0;"></div>' +
+      '<div style="height:6px;background:#3a2c14;border-radius:3px;margin:3px 0 1px;"><div id="ccauto-bar" style="height:100%;width:0%;background:#e8b64c;border-radius:3px;transition:width .5s;"></div></div>' +
+      '<button id="ccauto-expand" style="display:none;margin-top:4px;">再表示</button>' +
+      '<div id="ccauto-controls">' +
+      '<div style="margin-top:6px;">' +
+      '<button id="ccauto-toggle" style="margin-right:4px;">停止/再開</button>' +
+      '<button id="ccauto-mode" style="margin-right:4px;">モード切替</button>' +
+      '<button id="ccauto-backup" style="margin-right:4px;">💾 バックアップ</button>' +
+      '<button id="ccauto-rate">👆 速度</button>' +
+      '</div>' +
+      '<div style="margin-top:4px;">👆速度 ' +
+      '<button class="ccauto-rp" data-rate="0" style="margin-right:2px;padding:2px 5px;">止</button>' +
+      '<button class="ccauto-rp" data-rate="2" style="margin-right:2px;padding:2px 5px;">2</button>' +
+      '<button class="ccauto-rp" data-rate="10" style="margin-right:2px;padding:2px 5px;">10</button>' +
+      '<button class="ccauto-rp" data-rate="50" style="margin-right:2px;padding:2px 5px;">50</button>' +
+      '<button class="ccauto-rp" data-rate="100" style="margin-right:2px;padding:2px 5px;">100</button>' +
+      '<button class="ccauto-rp" data-rate="200" style="margin-right:2px;padding:2px 5px;">200</button>' +
+      '<button class="ccauto-rp" data-rate="250" style="padding:2px 5px;">250</button>' +
+      '</div>' +
+      '<div style="margin-top:4px;">' +
+      '<button id="ccauto-full" style="margin-right:4px;">⛶ 全画面</button>' +
+      '<button id="ccauto-report" style="margin-right:4px;">📤 送信先設定</button>' +
+      '<button id="ccauto-secret" style="margin-right:4px;">🔑 合言葉設定</button>' +
+      '<button id="ccauto-zoom" style="margin-right:4px;">🔍 縮小</button>' +
+      '<button id="ccauto-wake" style="margin-right:4px;">💡 画面維持</button>' +
+      '<button id="ccauto-test" style="margin-right:4px;">📨 送信テスト</button>' +
+      '<button id="ccauto-min">最小化</button>' +
+      '</div>' +
+      '<div id="ccauto-log" style="margin-top:6px;max-height:110px;overflow:auto;font-size:11px;color:#d8c690;"></div>' +
+      '</div>';
+    document.body.appendChild(panel);
+    document.getElementById('ccauto-toggle').addEventListener('click', function () {
+      state.running = !state.running;
+      if (state.running) { state.halted = false; gmSet('ccauto_halted', 0); state.anomalies = 0; state.pendingVerify = null; gmSet('ccauto_pendingVerify', ''); }
+      saveState(); log(state.running ? '再開しました' : '停止しました'); renderPanel();
+    });
+    document.getElementById('ccauto-mode').addEventListener('click', function () {
+      state.mode = (state.mode === 'auto') ? 'readonly' : 'auto';
+      if (state.mode === 'auto') gmSet('ccauto_approvedVersion', SCRIPT_VERSION); // この版での自動購入を承認済みにする
+      saveState(); log('モードを ' + state.mode + ' にしました'); renderPanel();
+    });
+    document.getElementById('ccauto-backup').addEventListener('click', function () { exportSave(true); });
+    document.getElementById('ccauto-rate').addEventListener('click', function () {
+      var cur = clickRate();
+      var u = window.prompt('大クッキーの自動クリック速度を入力してください（回/秒、0で停止、最大250。重くなったら下げてください）', cur);
+      if (u === null) return;
+      var v = parseFloat(u);
+      if (isNaN(v)) { log('速度の入力が数字ではありませんでした'); return; }
+      if (v < 0) v = 0;
+      if (v > 250) v = 250;
+      gmSet('ccauto_clickRate', '' + v);
+      scheduleClicks();
+      log('クリック速度を ' + v + '/秒 にしました');
+      renderPanel();
+    });
+    document.getElementById('ccauto-zoom').addEventListener('click', function () {
+      var z = (gmGet('ccauto_zoom', '') === '0.9') ? '' : '0.9';
+      gmSet('ccauto_zoom', z);
+      try { document.body.style.zoom = z; } catch (e) { /* ignore */ }
+      log(z ? '画面を90%に縮小しました' : '画面の縮小を解除しました');
+      renderPanel();
+    });
+    document.getElementById('ccauto-expand').addEventListener('click', function () {
+      gmSet('ccauto_mini', ''); renderPanel();
+    });
+    document.getElementById('ccauto-min').addEventListener('click', function () {
+      gmSet('ccauto_mini', '1'); renderPanel();
+    });
+    var rpBtns = panel.querySelectorAll('.ccauto-rp');
+    for (var ri = 0; ri < rpBtns.length; ri++) {
+      rpBtns[ri].addEventListener('click', function () {
+        var v = parseFloat(this.getAttribute('data-rate')) || 0;
+        gmSet('ccauto_clickRate', '' + v);
+        scheduleClicks();
+        log('クリック速度を ' + v + '/秒 にしました');
+        renderPanel();
+      });
+    }
+    document.getElementById('ccauto-wake').addEventListener('click', function () {
+      var on = gmGet('ccauto_wake', '') === '1';
+      gmSet('ccauto_wake', on ? '' : '1');
+      if (!on) acquireWakeLock(); else releaseWakeLock();
+      renderPanel();
+    });
+    document.getElementById('ccauto-full').addEventListener('click', function () {
+      try {
+        if (document.fullscreenElement) { document.exitFullscreen(); }
+        else {
+          var p = document.documentElement.requestFullscreen();
+          if (p && p.catch) p.catch(function () { log('全画面にできませんでした'); });
+        }
+      } catch (e) { log('全画面にできませんでした'); }
+    });
+    document.getElementById('ccauto-report').addEventListener('click', function () {
+      var cur = gmGet('ccauto_reportUrl', '');
+      var u = window.prompt('状態の送信先URL（Apps ScriptのWebアプリURL）を貼り付けてください', cur);
+      if (u === null) return;
+      u = ('' + u).replace(/\s+/g, '');
+      gmSet('ccauto_reportUrl', u);
+      log(u ? '送信先を設定しました' : '送信先を消去しました');
+      if (u) reportStep();
+      renderPanel();
+    });
+    document.getElementById('ccauto-secret').addEventListener('click', function () {
+      var cur = gmGet('ccauto_reportSecret', '');
+      var u = window.prompt('状態送信の合言葉（Apps Script側と対の文字列）を貼り付けてください', cur);
+      if (u === null) return;
+      u = ('' + u).replace(/\s+/g, '');
+      gmSet('ccauto_reportSecret', u);
+      log(u ? '合言葉を設定しました' : '合言葉を消去しました');
+      if (u) reportStep();
+      renderPanel();
+    });
+    document.getElementById('ccauto-test').addEventListener('click', function () { reportTest(); });
+    try { document.body.style.zoom = gmGet('ccauto_zoom', ''); } catch (e) { /* ignore */ }
+  }
+
+  var wakeLockObj = null;
+  function acquireWakeLock() {
+    try {
+      if (!('wakeLock' in navigator)) { log('このブラウザは画面維持に対応していません'); return; }
+      navigator.wakeLock.request('screen').then(function (lock) {
+        wakeLockObj = lock;
+        log('画面スリープ防止を有効にしました');
+        lock.addEventListener('release', function () { wakeLockObj = null; });
+      }).catch(function () { log('画面スリープ防止を有効化できませんでした'); });
+    } catch (e) { log('このブラウザは画面維持に対応していません'); }
+  }
+  function releaseWakeLock() {
+    try { if (wakeLockObj) { wakeLockObj.release(); wakeLockObj = null; } } catch (e) { /* ignore */ }
+    log('画面スリープ防止を解除しました');
+  }
+
+  function renderPanel() {
+    // パネルの自己修復：消えていたら作り直し、外れていたら付け直す
+    if (!panel || !document.getElementById('ccauto-panel')) { panel = null; buildPanel(); }
+    if (panel && panel.parentNode !== document.body) document.body.appendChild(panel);
+    if (!panel) return;
+    var st = document.getElementById('ccauto-status');
+    var nx = document.getElementById('ccauto-next');
+    var lg = document.getElementById('ccauto-log');
+    if (!st) return;
+    var mini = gmGet('ccauto_mini', '1') === '1';
+    var ctlEl = document.getElementById('ccauto-controls');
+    var expEl = document.getElementById('ccauto-expand');
+    var ttlEl = document.getElementById('ccauto-title');
+    if (ctlEl) ctlEl.style.display = mini ? 'none' : 'block';
+    if (expEl) expEl.style.display = mini ? 'inline-block' : 'none';
+    if (ttlEl) ttlEl.style.display = mini ? 'none' : 'block';
+    panel.style.maxWidth = mini ? '240px' : '270px';
+    var modeLabel = (state.mode === 'auto') ? '自動購入' : '読み取り専用';
+    var runLabel = state.halted ? '購入停止中（異常検知）' : (state.running ? '稼働中' : '停止中');
+    var statsTxt = '';
+    if (gameReady()) {
+      statsTxt = '所持 ' + fmt(W.Game.cookies) + ' / CpS ' + fmt(baseCps()) +
+        ' / 👆' + (clickRate() > 0 ? clickRate() + '/秒（実測' + Math.round(measuredClickRate()) + '）' : 'オフ');
+      if (!state.nextTarget) {
+        try {
+          var ev = evaluateCandidates();
+          if (ev.list.length) {
+            state.nextTarget = ev.list[0].label;
+            state.nextDetail = '価格 ' + fmt(ev.list[0].price);
+            state.targetPrice = ev.list[0].price;
+            if (!state.goal1) {
+              var bk = W.Game.cookies;
+              var incF = totalIncome(ev.cpsNow);
+              var second = null;
+              for (var fi = 1; fi < ev.list.length; fi++) { if (ev.list[fi].price <= bk) { second = ev.list[fi]; break; } }
+              if (!second && ev.list.length > 1) second = ev.list[1];
+              setGoals(ev.list[0], second, ev.list[0].price <= bk ? 1 : (second ? 2 : 1), false, bk, incF);
+            }
+          }
+        } catch (e) { /* ignore */ }
+      }
+    } else if (isChallengePage()) {
+      statsTxt = '⚠ 確認画面のため停止中';
+    } else {
+      statsTxt = 'ゲーム読み込み待ち';
+    }
+    var rep = !gmGet('ccauto_reportUrl', '') ? ' / 送信先未設定' : (!reportSecret() ? ' / 合言葉未設定' : (state.lastReport ? ' / 送信 ' + state.lastReport : ''));
+    st.textContent = runLabel + '（' + modeLabel + '）' + rep;
+    st.style.color = state.running ? '#b6f09c' : '#ffb27d';
+    st.style.fontWeight = 'bold';
+    var statsEl = document.getElementById('ccauto-stats');
+    if (statsEl) statsEl.textContent = statsTxt;
+    var esc = function (s) { return ('' + s).replace(/</g, '&lt;'); };
+    var nxHtml = '';
+    if (state.goal1) {
+      var bankNow = 0;
+      try { bankNow = W.Game.cookies; } catch (e) { bankNow = 0; }
+      var goalLine = function (tag, g) {
+        var h = tag + ': ' + esc(g.label) + ' 達成率' + g.pct + '%' +
+          (g.active ? ' <span style="color:#b6f09c;">← 遂行中</span>' : '');
+        if (g.kind === 'set' && g.setNeed) {
+          h += '<br><span style="color:#ffd98a;">' + (g.setAmt || 0) + '軒 / ' + g.setNeed + '軒</span>';
+        }
+        if (g.price > bankNow) {
+          h += '<br><span style="color:#ffd98a;">あと ' + fmt(g.price - bankNow) + (g.etaSec > 0 ? '、約' + fmtDur(g.etaSec) : '') + '</span>';
+        }
+        return h;
+      };
+      nxHtml += goalLine('第1目標', state.goal1);
+      if (state.goal2) nxHtml += '<br>' + goalLine('第2目標', state.goal2);
+      else if (state.goalSaving) nxHtml += '<br>第2目標: なし（第1目標のために貯金中）';
+    } else {
+      nxHtml = '次: ' + esc(state.nextTarget || '―') +
+        (state.nextDetail ? '<br><span style="color:#ffd98a;">' + esc(state.nextDetail) + '</span>' : '');
+    }
+    nx.innerHTML = nxHtml;
+    var barEl = document.getElementById('ccauto-bar');
+    if (barEl) {
+      var pct = 0;
+      if (state.goal1) {
+        // 進捗バーは「いま遂行中の目標」の達成率を表示する
+        pct = (state.goalActive === 2 && state.goal2) ? state.goal2.pct : state.goal1.pct;
+      } else if (gameReady() && state.targetPrice > 0) {
+        pct = Math.min(100, Math.floor(W.Game.cookies / state.targetPrice * 100));
+      }
+      barEl.style.width = pct + '%';
+    }
+    var rps = panel.querySelectorAll('.ccauto-rp');
+    for (var qi = 0; qi < rps.length; qi++) {
+      rps[qi].style.background = (parseFloat(rps[qi].getAttribute('data-rate')) === clickRate()) ? '#7a5c14' : '';
+      rps[qi].style.color = (parseFloat(rps[qi].getAttribute('data-rate')) === clickRate()) ? '#ffe9b0' : '';
+    }
+    var wkEl = document.getElementById('ccauto-wake');
+    if (wkEl) {
+      var wkOn = gmGet('ccauto_wake', '') === '1';
+      wkEl.textContent = !wkOn ? '💡 画面維持' : (wakeLockObj ? '💡 画面維持:ON' : '💡 画面維持:試行中');
+    }
+    lg.innerHTML = state.logs.slice(0, 12).map(function (s) {
+      return s.replace(/</g, '&lt;');
+    }).join('<br>');
+  }
+
+  /* ---------------- 起動 ---------------- */
+
+  function boot() {
+    if (isChallengePage()) {
+      // 確認画面では何もしない（自動で解こうとしない・再読み込みしない）
+      setTimeout(boot, 30000);
+      return;
+    }
+    buildPanel();
+    renderPanel();
+    log('スクリプトを開始しました（モード: ' + state.mode + '）');
+    // 以前の版で立った購入停止フラグは引き継がない（止まらない運用に変更したため）
+    if (state.halted) { state.halted = false; gmSet('ccauto_halted', 0); }
+    // 購入の検証が終わらないうちに再読み込みされた形跡があれば、報告だけして購入は続ける
+    if (gmGet('ccauto_pendingVerify', '')) {
+      gmSet('ccauto_pendingVerify', '');
+      reportError('購入の検証が未完了のまま再読み込みされました（購入は継続します）');
+    }
+
+    sampleClicks();
+    setInterval(sampleClicks, 1000);
+    setInterval(buyStep, CONFIG.buyIntervalMs);
+    setInterval(goldenStep, 1500);
+    setInterval(renderPanel, 5000);
+    setInterval(function () { gmSet('ccauto_lastBeat', Date.now()); }, 30000);
+    gmSet('ccauto_lastBeat', Date.now());
+    state.lastReport = gmGet('ccauto_lastReport', '');
+    setTimeout(reportStep, 15000);
+    setInterval(reportStep, CONFIG.reportIntervalMs);
+
+    scheduleClicks();
+    if (gmGet('ccauto_wake', '') === '1') acquireWakeLock();
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden && gmGet('ccauto_wake', '') === '1' && !wakeLockObj) acquireWakeLock();
+    });
+    if (CONFIG.autoBackupHours > 0) {
+      setInterval(function () {
+        var last = gmGet('ccauto_lastBackup', 0);
+        if (Date.now() - last >= CONFIG.autoBackupHours * 3600 * 1000) exportSave(false);
+      }, 60000);
+    }
+  }
+
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    setTimeout(boot, 3000);
+  } else {
+    window.addEventListener('load', function () { setTimeout(boot, 3000); });
+  }
+})();
