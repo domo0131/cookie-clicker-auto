@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.2.1
+// @version      2.2.2
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -11,6 +11,7 @@
 // @grant        GM_xmlhttpRequest
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
+// @connect      raw.githubusercontent.com
 // @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
@@ -29,11 +30,12 @@
     autoBackupHours: 0,      // セーブの自動書き出し間隔（時間）。0 = 自動では書き出さない（パネルのボタンで手動実行）
     logMax: 60,              // パネルに残す購入ログの件数
     reportSecret: '', // （v2.2.0で廃止）合言葉はコードに書かず、パネルの「🔑 合言葉設定」から保存する（公開リポジトリに載せないため）
-    reportIntervalMs: 60000  // 状態送信の間隔（ミリ秒）。送信先URLはパネルの「送信先設定」から保存する
+    reportIntervalMs: 60000,  // 状態送信の間隔（ミリ秒）。送信先URLはパネルの「送信先設定」から保存する
+    updateCheckMinutes: 10   // 新しい版が出ていないか GitHub を確認する間隔（分）。新版があれば保存して再読み込みし、取り込む
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.2.1'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.2.2'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1288,6 +1290,56 @@ function fmt(n) {
     }).join('<br>');
   }
 
+  /* ---------------- 新しい版の取り込み（v2.2.2） ----------------
+     GitHub 上の最新版を定期的に確認し、新しい版があれば、ゲームの状態を残してから
+     ページを再読み込みして取り込む（Tampermonkey 本体の更新確認を待たないため）。
+     Tampermonkey 側にまだ新版が届いていない場合は再読み込みしても版が変わらないので、
+     同じ版に対しては6時間あけて再試行し、再読み込みの繰り返しを防ぐ。 */
+  var UPDATE_URL = 'https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js';
+  function parseRemoteVersion(text) {
+    var m = /\/\/\s*@version\s+([0-9]+(?:\.[0-9]+)*)/.exec(text || '');
+    return m ? m[1] : null;
+  }
+  function versionNewer(a, b) { // a が b より新しければ true
+    var pa = ('' + a).split('.'), pb = ('' + b).split('.');
+    var n = Math.max(pa.length, pb.length);
+    for (var i = 0; i < n; i++) {
+      var d = (parseInt(pa[i], 10) || 0) - (parseInt(pb[i], 10) || 0);
+      if (d > 0) return true;
+      if (d < 0) return false;
+    }
+    return false;
+  }
+  function checkForUpdate() {
+    if (!gameReady() || isChallengePage()) return;
+    if (typeof GM_xmlhttpRequest !== 'function') return;
+    GM_xmlhttpRequest({
+      method: 'GET',
+      url: UPDATE_URL,
+      timeout: 20000,
+      onload: function (res) {
+        if (!res || res.status !== 200) return;
+        var rv = parseRemoteVersion(('' + (res.responseText || '')).slice(0, 4000));
+        if (!rv) return;
+        if (!versionNewer(rv, SCRIPT_VERSION)) {
+          gmSet('ccauto_updateGuard', ''); // すでに最新なら試行ガードを解除する
+          return;
+        }
+        var guard = null;
+        try { guard = JSON.parse(gmGet('ccauto_updateGuard', '') || 'null'); } catch (e) { guard = null; }
+        var now = Date.now();
+        if (guard && guard.forVersion === rv && (now - (guard.at || 0)) < 6 * 3600 * 1000) return; // 取り込み試行済み。間隔をあけて再試行する
+        gmSet('ccauto_updateGuard', JSON.stringify({ forVersion: rv, at: now }));
+        log('新しいバージョン（' + rv + '）を取り込むため、保存して再読み込みします');
+        try { gmSet('ccauto_preReloadSave', W.Game.WriteSave(1)); } catch (e2) { /* ignore */ } // 念のため直前のセーブを控える
+        try { reportStep(); } catch (e3) { /* ignore */ }
+        setTimeout(function () { try { location.reload(); } catch (e4) { /* ignore */ } }, 3000);
+      },
+      onerror: function () { /* 取れなければ次の確認に回す */ },
+      ontimeout: function () { /* 同上 */ }
+    });
+  }
+
   /* ---------------- 起動 ---------------- */
 
   function boot() {
@@ -1317,6 +1369,8 @@ function fmt(n) {
     state.lastReport = gmGet('ccauto_lastReport', '');
     setTimeout(reportStep, 15000);
     setInterval(reportStep, CONFIG.reportIntervalMs);
+    setTimeout(checkForUpdate, 120000);
+    setInterval(checkForUpdate, CONFIG.updateCheckMinutes * 60000);
 
     scheduleClicks();
     if (gmGet('ccauto_wake', '') === '1') acquireWakeLock();
