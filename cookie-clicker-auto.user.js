@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.9
+// @version      2.3.10
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.9'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.10'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -209,11 +209,29 @@ function fmt(n) {
   // 測定専用の物差し（v2.2.1で統一）: CalculateGains() がその場で更新する値だけを読む。
   // unbuffedCps はメインループ側の更新で、同期的な再計算の中では追随しないことがある（v2.1.1の診断で判明）。
   // 効果のシミュレーションと購入後検証は、必ずこの同じ物差しで測ること（物差しの混在が異常値の原因だった）。
+  // バフ倍率の積（生産倍率とクリック倍率の両方）。クリック値はバフ込みで計算されるため、
+  // 予測・購入・検証の物差しを「素のクリック値」にそろえるのに使う
+  function buffMultProduct() {
+    var m = 1;
+    try {
+      var buffs = W.Game.buffs || {};
+      for (var k in buffs) {
+        var b = buffs[k];
+        if (!b || !(b.time > 0)) continue;
+        if (typeof b.multCpS === 'number' && b.multCpS > 0) m *= b.multCpS;
+        if (typeof b.multClick === 'number' && b.multClick > 0) m *= b.multClick;
+      }
+    } catch (e) { /* ignore */ }
+    return m > 0 ? m : 1;
+  }
+
   function readProduction() {
     var G = W.Game;
     var cps = 0, click = 0;
     try { cps = (typeof G.cookiesPsRaw === 'number' && G.cookiesPsRaw > 0) ? G.cookiesPsRaw : baseCps(); } catch (e) { cps = 0; }
-    try { click = mouseCps(); } catch (e2) { click = 0; }
+    // CpS 側（cookiesPsRaw）はバフなしの値なので、クリック側もバフ倍率で割って素の値にそろえる。
+    // そろえないと、長いバフの最中の購入で検証のクリック分だけが倍率ぶん膨らんで誤報になる
+    try { click = mouseCps() / buffMultProduct(); } catch (e2) { click = 0; }
     return { cps: cps, click: click };
   }
 
