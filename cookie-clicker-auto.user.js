@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.14
+// @version      2.3.15
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.14'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.15'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -714,6 +714,35 @@ function fmt(n) {
     return 1 + mouseOwned * 0.01 * (rate || 0);
   }
 
+  // 天界チップ解放系（通常ショップの5種）: プレステージ倍率（+1%/レベル）を段階的に解放する。
+  // 解放率とプレステージ数が分かれば増産は計算式で正確に出る。実測シミュレーションだと
+  // 増分が現CpSの何倍にもなり、異常値ガード（現CpSの2倍超は無効）に引っかかって
+  // 永遠に買えなくなるため、この5種だけは式で評価する（GC系・割引系と同じ「特殊な仕組みは別扱い」）。
+  var PRESTIGE_UNLOCKERS = [
+    { name: 'Heavenly chip secret', to: 0.05 },
+    { name: 'Heavenly cookie stand', to: 0.25 },
+    { name: 'Heavenly bakery', to: 0.50 },
+    { name: 'Heavenly confectionery', to: 0.75 },
+    { name: 'Heavenly key', to: 1.00 }
+  ];
+  function prestigeUnlockerGain(up, cpsNow) {
+    var G = W.Game;
+    var prestige = 0;
+    try { prestige = G.prestige || 0; } catch (e) { prestige = 0; }
+    if (!(prestige > 0) || !(cpsNow > 0)) return 0;
+    var step = null, cur = 0;
+    for (var i = 0; i < PRESTIGE_UNLOCKERS.length; i++) {
+      if (PRESTIGE_UNLOCKERS[i].name === up.name) step = PRESTIGE_UNLOCKERS[i];
+      var pu = findUpgrade(G, PRESTIGE_UNLOCKERS[i].name);
+      if (pu && pu.bought) cur = PRESTIGE_UNLOCKERS[i].to; // 解放率は所有済みの最も進んだ段階まで
+    }
+    if (!step || step.to <= cur) return 0; // 対象外、または前の段階が先（店頭には順番どおりに並ぶ）
+    // 現在のCpSは解放率curの倍率を含んだ値なので、差分は割り戻して計算する
+    var dcps = cpsNow * prestige * (step.to - cur) / (1 + prestige * cur);
+    if (!(dcps > 0)) return 0;
+    return dcps * clickBoostNow(measuredClickRate());
+  }
+
   function evaluateCandidates() {
     var G = W.Game;
     var out = [];
@@ -763,6 +792,16 @@ function fmt(n) {
           out.push({
             kind: 'upgrade', ref: up, label: up.name,
             price: gbPrice, gain: gbGain, payback: gbPrice / gbGain, noVerify: true
+          });
+          continue;
+        }
+        // 天界チップ解放系は計算式で評価する（シミュレーションの異常値ガードに引っかかる大きさのため）
+        var puGain = prestigeUnlockerGain(up, cpsNow);
+        if (puGain > 0) {
+          var puPrice = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice;
+          out.push({
+            kind: 'upgrade', ref: up, label: up.name,
+            price: puPrice, gain: puGain, payback: puPrice / puGain, noVerify: true
           });
           continue;
         }
