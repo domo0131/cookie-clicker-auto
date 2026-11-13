@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      1.0.0
+// @version      1.1.0
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-loader.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-loader.user.js
 // @description  ローダー: 本体スクリプトを GitHub から直接取得して実行する薄い入れ物。本体の更新は Tampermonkey の更新確認を待たず、push から数分で届く。取得できないときは前回取得した本体で起動する。
@@ -86,7 +86,15 @@
           gSet(K_CODE, code); gSet(K_VER, ver);
         }
         if (!executed) { if (!runBody(code, ver)) runCached(); }
-        else if (isNewer(ver, runningVer)) { setTimeout(function () { try { location.reload(); } catch (e) {} }, 3000); }
+        else if (isNewer(ver, runningVer)) {
+          // 本体が自動昇天などの重要な処理の最中なら、切り替え（再読み込み）を次回確認まで延期する
+          var busy = false;
+          try {
+            var fl = GM_getValue('ccauto_ascendFlow', null);
+            if (fl && fl.phase && fl.phase !== 'done' && fl.phase !== 'stuck') busy = true;
+          } catch (e) { busy = false; }
+          if (!busy) { setTimeout(function () { try { location.reload(); } catch (e) {} }, 3000); }
+        }
       },
       onerror: function () { if (isBoot && !executed) runCached(); },
       ontimeout: function () { if (isBoot && !executed) runCached(); }
