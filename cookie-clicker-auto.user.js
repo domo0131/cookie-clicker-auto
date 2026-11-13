@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.1
+// @version      2.3.2
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.1'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.2'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1730,7 +1730,9 @@ function fmt(n) {
     if (f.phase === 'stuck') {
       // 再読み込みで止まった場合だけ、昇天が「実行されていない」と証明できれば復旧する。
       // 昇天画面にいるなら購入から再開、通常画面で何も買われていなければ最初からやり直す
-      if (f.stuckReason !== 'reload') return;
+      // v2.3.0 が理由を記録する前に止めた分も、購入が1件も進んでいなければ同じ扱いにする
+      if (f.stuckReason !== 'reload' &&
+          !(!f.stuckReason && !(f.bought || []).length && !(f.failed || []).length && !(f.skipped || []).length)) return;
       var planBought = false;
       for (var bi = 0; bi < ASCEND_PLAN.length; bi++) {
         var bup = G.Upgrades[ASCEND_PLAN[bi][0]];
