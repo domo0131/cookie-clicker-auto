@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.7
+// @version      2.3.8
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.7'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.8'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -273,7 +273,89 @@ function fmt(n) {
   // 個別指定で候補に入れ、見なし増産で順位付けする（自動でゴールデンクッキーを拾う運用が前提）。
   // 効果を検証できないので、購入後の検証は記録しない（noVerify）。
   var GC_BOOSTER_NAMES = ['lucky day', 'serendipity', 'get lucky'];
-  var GC_BOOSTER_GAIN_RATE = 0.25; // 順位付け用の見なし増産率（現在の CpS の25%相当とみなす）
+  var GC_BOOSTER_GAIN_RATE = 0.25; // 計測が貯まるまでの暫定の見なし増産率（現在の CpS の25%相当）
+
+  /* GC由来収入の計測（v2.3.8。ChatGPT相談に基づくハイブリッド方式）:
+     バフによる上乗せ生産と、GCクリック時の即時付与を、その時点の素の CpS で割って
+     正規化しながら貯める。評価時は「正規化した収入率 × 現在の素の CpS」で増産に換算する。
+     構成（周回数とGC系の所有状況）が変わったら別の区切りとして測り直す。 */
+  var gcTel = (function () {
+    try { var v = gmGet('ccauto_gcTel', null); if (v && typeof v.secs === 'number') return v; } catch (e) { /* ignore */ }
+    return { fp: '', secs: 0, buffNorm: 0, instNorm: 0, clicks: 0, announced: 0 };
+  })();
+  function gcFingerprint(G) {
+    var s = '' + (G.resets || 0) + '|';
+    for (var i = 0; i < GC_BOOSTER_NAMES.length; i++) {
+      var u = findUpgrade(G, GC_BOOSTER_NAMES[i]);
+      s += (u && u.bought) ? '1' : '0';
+    }
+    return s;
+  }
+  function sampleGcIncome() {
+    var G = W.Game;
+    if (!state.running || ascendBusy()) return;
+    var fp = gcFingerprint(G);
+    if (gcTel.fp !== fp) gcTel = { fp: fp, secs: 0, buffNorm: 0, instNorm: 0, clicks: 0, announced: 0 };
+    var base = 0, finalCps = 0, mc = 1;
+    try {
+      base = (typeof G.cookiesPsRaw === 'number') ? G.cookiesPsRaw : 0;
+      finalCps = (typeof G.cookiesPs === 'number') ? G.cookiesPs : base;
+      var buffs = G.buffs || {};
+      for (var bn in buffs) { var bf = buffs[bn]; if (bf && typeof bf.multClick === 'number' && bf.multClick > 0) mc *= bf.multClick; }
+    } catch (e) { return; }
+    if (!(base > 0)) return;
+    var clickNow = 0, clickBase = 0;
+    try { clickNow = mouseCps(); clickBase = mc > 0 ? clickNow / mc : clickNow; } catch (e) { clickNow = 0; clickBase = 0; }
+    var extra = Math.max(0, finalCps - base) + clickRate() * Math.max(0, clickNow - clickBase);
+    gcTel.buffNorm += extra / base;
+    gcTel.secs++;
+    if (gcTel.secs % 60 === 0) { try { gmSet('ccauto_gcTel', gcTel); } catch (e) { /* ignore */ } }
+    if (!gcTel.announced && gcTel.secs >= 300 && gcTel.clicks >= 5) {
+      gcTel.announced = 1;
+      log('ゴールデンクッキーの収入計測が貯まったため、GC系の評価を実測に切り替えます');
+    }
+  }
+  function gcEventStart() {
+    try {
+      var G = W.Game;
+      var sh = G.shimmers || [];
+      var n = 0;
+      for (var i = 0; i < sh.length; i++) { if (sh[i] && sh[i].type === 'golden' && !sh[i].wrath) n++; }
+      if (n <= 0) return null;
+      return {
+        e0: G.cookiesEarned || 0,
+        base0: (typeof G.cookiesPsRaw === 'number') ? G.cookiesPsRaw : 0,
+        rate0: ((typeof G.cookiesPs === 'number') ? G.cookiesPs : 0) + clickRate() * mouseCps(),
+        clicks0: G.goldenClicks || 0,
+        fp: gcFingerprint(G)
+      };
+    } catch (e) { return null; }
+  }
+  function gcEventFinish(tok) {
+    setTimeout(function () {
+      try {
+        var G = W.Game;
+        if (!tok || gcFingerprint(G) !== tok.fp || gcTel.fp !== tok.fp) return;
+        var dc = (G.goldenClicks || 0) - tok.clicks0;
+        if (dc <= 0) return;
+        gcTel.clicks += dc;
+        var inst = (G.cookiesEarned || 0) - tok.e0 - tok.rate0 * 0.7;
+        if (inst > 0 && tok.base0 > 0) gcTel.instNorm += inst / tok.base0;
+        try { gmSet('ccauto_gcTel', gcTel); } catch (e2) { /* ignore */ }
+      } catch (e) { /* ignore */ }
+    }, 700);
+  }
+  function gcBoosterGain(up, cpsNow) {
+    var isDuration = ((up.name || '').toLowerCase() === 'get lucky');
+    if (gcTel.secs >= 300 && gcTel.clicks >= 5 && cpsNow > 0) {
+      // 頻度系は GC 由来収入の全体、時間系はバフ由来分が、それぞれ約2倍になる分を増産とみなす
+      var rate = (isDuration ? gcTel.buffNorm : (gcTel.buffNorm + gcTel.instNorm)) / gcTel.secs;
+      var g = rate * cpsNow;
+      if (g > cpsNow * 3) g = cpsNow * 3; // 暴走防止の上限
+      if (g > 0) return g;
+    }
+    return cpsNow * GC_BOOSTER_GAIN_RATE;
+  }
 
   // 全体系アップグレードの候補判定。名前のパターンでは判定しない。
   // （名前に "heavenly" と付く通常ショップ品を天上品と誤認し、名声解放の5つを買い逃した事故の教訓。v2.3.6）
@@ -557,7 +639,7 @@ function fmt(n) {
         if (!isGlobalAdmissible(up)) continue;
         // ゴールデンクッキー系は再計算で測れないので、見なし増産で回収順位に混ぜる
         if (GC_BOOSTER_NAMES.indexOf((up.name || '').toLowerCase()) >= 0) {
-          var gbGain = cpsNow * GC_BOOSTER_GAIN_RATE;
+          var gbGain = gcBoosterGain(up, cpsNow);
           if (!(gbGain > 0)) continue;
           var gbPrice = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice;
           out.push({
@@ -742,6 +824,7 @@ function fmt(n) {
       var now = Date.now();
       clickSamples.push([now, W.Game.cookieClicks || 0]);
       while (clickSamples.length > 2 && now - clickSamples[0][0] > 30000) clickSamples.shift();
+      try { sampleGcIncome(); } catch (e2) { /* ignore */ }
     } catch (e) { /* ignore */ }
   }
   function measuredClickRate() {
@@ -1050,6 +1133,28 @@ function fmt(n) {
     if (clickAcc < 0) clickAcc = 0;
   }
 
+  // クリックの見張り: 再読み込みなどでタイマーが止まったままになっていたら張り直す
+  var clickWatchLast = -1, clickWatchFlatAt = 0;
+  function clickWatchdog() {
+    if (!state.running || clickRate() <= 0) { clickWatchLast = -1; clickWatchFlatAt = 0; return; }
+    if (!clickTimer) { scheduleClicks(); if (clickTimer) log('クリックのタイマーが止まっていたため再設定しました'); return; }
+    if (!gameReady() || isChallengePage() || ascendBusy()) { clickWatchLast = -1; clickWatchFlatAt = 0; return; }
+    var c = 0;
+    try { c = W.Game.cookieClicks || 0; } catch (e) { return; }
+    if (clickWatchLast >= 0 && c <= clickWatchLast) {
+      if (!clickWatchFlatAt) clickWatchFlatAt = Date.now();
+      if (Date.now() - clickWatchFlatAt >= 30000) {
+        clickAcc = 0; clickLastAt = 0;
+        scheduleClicks();
+        clickWatchFlatAt = 0;
+        log('クリックが止まっていたため再設定しました');
+      }
+    } else {
+      clickWatchFlatAt = 0;
+    }
+    clickWatchLast = c;
+  }
+
   function goldenStep() {
     if (!state.running || !CONFIG.clickGolden) return;
     if (!gameReady() || isChallengePage()) return;
@@ -1058,6 +1163,7 @@ function fmt(n) {
     if (holoboreState() !== 'none') return;
     try {
       var shimmers = W.Game.shimmers || [];
+      var gcTok = gcEventStart();
       for (var i = 0; i < shimmers.length; i++) {
         var s = shimmers[i];
         if (s.type === 'golden' && !s.wrath) {
@@ -1071,6 +1177,7 @@ function fmt(n) {
           }, 500);
         }
       }
+      if (gcTok) gcEventFinish(gcTok);
     } catch (e) { /* ignore */ }
   }
 
@@ -1674,6 +1781,11 @@ function fmt(n) {
     ['Starter kit', 50], ['Heavenly luck', 77], ['Permanent upgrade slot I', 100],
     ['Heralds', 100], ['Persistent memory', 500], ['Lasting fortune', 777]
   ];
+  // ラッキー系の追加購入（出現条件があるため本プランとは分ける。発動条件のチップ合計には含めない）
+  // [名前, チップ費用, 名声レベルの数字に必要な「7」の個数]
+  var ASCEND_EXTRA_PLAN = [
+    ['Lucky digit', 777, 1], ['Lucky number', 77777, 2], ['Lucky payout', 77778000, 4]
+  ];
   // 名前の大文字小文字の表記ゆれで「未発見」にならないよう、小文字化して照合する
   function findUpgrade(G, name) {
     if (!G.Upgrades) return null;
@@ -1865,6 +1977,24 @@ function fmt(n) {
         return;
       }
       if (f.idx >= ASCEND_PLAN.length) {
+        // 本プランが終わったら、ラッキー系の追加購入を試す（条件がそろったときだけ買う）
+        if (!f.inExtras) { f.inExtras = 1; f.xidx = 0; ascendSaveFlow(f); return; }
+        if ((f.xidx || 0) < ASCEND_EXTRA_PLAN.length) {
+          var xitem = ASCEND_EXTRA_PLAN[f.xidx]; f.xidx++;
+          var xname = xitem[0];
+          var xup = findUpgrade(G, xname);
+          if (!xup) { ascendSaveFlow(f); return; } // 追加分は未発見でも失敗にしない
+          if (xup.bought) { f.bought.push(xname); ascendSaveFlow(f); return; }
+          // 出現条件: 昇天後の名声レベルの数字に「7」が一定個数含まれること（ゲーム側の仕様）
+          var sevenCount = (('' + Math.floor(G.prestige || 0)).match(/7/g) || []).length;
+          if (sevenCount < xitem[2]) { f.skipped.push(xname + '（出現条件未達）'); ascendSaveFlow(f); return; }
+          if (typeof xup.canBuy === 'function' && !xup.canBuy()) { f.skipped.push(xname + '（未解放）'); ascendSaveFlow(f); return; }
+          var xcost = (typeof xup.basePrice === 'number') ? xup.basePrice : xitem[1];
+          if ((G.heavenlyChips || 0) < xcost) { f.skipped.push(xname + '（チップ不足）'); ascendSaveFlow(f); return; }
+          try { xup.buy(); } catch (e) { f.skipped.push(xname + '（購入失敗）'); ascendSaveFlow(f); return; }
+          f.pendingCheck = xname; f.retries = 0; ascendSaveFlow(f);
+          return;
+        }
         var slotUp = findUpgrade(G, 'Permanent upgrade slot I');
         f.phase = (slotUp && slotUp.bought) ? 'slot' : 'reincarnate';
         ascendSaveFlow(f);
@@ -1988,6 +2118,8 @@ function fmt(n) {
     setInterval(checkForUpdate, CONFIG.updateCheckMinutes * 60000);
 
     scheduleClicks();
+    setInterval(clickWatchdog, 5000);
+    if (state.running && clickRate() > 0) log('クリック設定を適用しました（' + clickRate() + '/秒）');
     if (gmGet('ccauto_wake', '') === '1') acquireWakeLock();
     document.addEventListener('visibilitychange', function () {
       if (!document.hidden && gmGet('ccauto_wake', '') === '1' && !wakeLockObj) acquireWakeLock();
@@ -1999,6 +2131,35 @@ function fmt(n) {
       }, 60000);
     }
   }
+
+  /* ---------------- 読み込み待ちの立て直し ----------------
+     ネットの一時的な不安定でゲームの読み込みが固まったままになったら、
+     一定時間待っても読み込みが終わらないときに再読み込みして立て直す。
+     連続するときは間隔を延ばす（15秒→60秒→180秒が上限）。確認画面では再読み込みしない。 */
+  var loadWatchStartedAt = Date.now();
+  var loadReadySince = 0;
+  function loadWatchdog() {
+    try {
+      if (gameReady()) {
+        // 読み込みが安定して続いたら、間隔延長の記録をリセットする（一瞬だけ復帰した場合は維持）
+        if (!loadReadySince) loadReadySince = Date.now();
+        if (Date.now() - loadReadySince >= 60000 && gmGet('ccauto_loadReload', '')) gmSet('ccauto_loadReload', '');
+        return;
+      }
+    } catch (e) { /* ignore */ }
+    loadReadySince = 0;
+    if (isChallengePage()) return; // 確認画面では再読み込みしない
+    var rec = null;
+    try { rec = JSON.parse(gmGet('ccauto_loadReload', '') || 'null'); } catch (e) { rec = null; }
+    if (!rec || typeof rec.count !== 'number') rec = { count: 0, at: 0 };
+    var waitMs = Math.min(180000, 15000 * Math.pow(4, Math.min(rec.count, 3)));
+    if (Date.now() - loadWatchStartedAt < waitMs) return;
+    rec.count++; rec.at = Date.now();
+    try { gmSet('ccauto_loadReload', JSON.stringify(rec)); } catch (e) { /* ignore */ }
+    try { log('ゲームの読み込みが進まないため再読み込みします（待機 ' + Math.round(waitMs / 1000) + ' 秒超え、' + rec.count + ' 回目）'); } catch (e) { /* ignore */ }
+    try { location.reload(); } catch (e) { /* ignore */ }
+  }
+  setInterval(loadWatchdog, 5000);
 
   if (document.readyState === 'complete' || document.readyState === 'interactive') {
     setTimeout(boot, 3000);
