@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.12
+// @version      2.3.13
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.12'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.13'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -2071,6 +2071,9 @@ function fmt(n) {
     if (!gameReady() || isChallengePage()) return;
     var G = W.Game;
     var f = ascendFlow();
+    // 前の周回で完了したフロー記録が残っていると、ここで永久に戻ってしまい
+    // 2周目以降の開始判定に一生たどり着けない。完了済みで自分の周回より前のものは「フローなし」として扱う
+    if (f && f.phase === 'done' && (f.run || 0) <= (G.resets || 0)) f = null;
     if (!f) { ascendMaybeStart(G); return; }
     if (f.phase === 'done') return;
     if (f.phase === 'stuck') {
