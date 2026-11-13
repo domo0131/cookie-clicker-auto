@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.0
+// @version      2.3.1
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.0'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.1'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1726,17 +1726,44 @@ function fmt(n) {
     var G = W.Game;
     var f = ascendFlow();
     if (!f) { ascendMaybeStart(G); return; }
-    if (f.phase === 'done' || f.phase === 'stuck') return;
+    if (f.phase === 'done') return;
+    if (f.phase === 'stuck') {
+      // 再読み込みで止まった場合だけ、昇天が「実行されていない」と証明できれば復旧する。
+      // 昇天画面にいるなら購入から再開、通常画面で何も買われていなければ最初からやり直す
+      if (f.stuckReason !== 'reload') return;
+      var planBought = false;
+      for (var bi = 0; bi < ASCEND_PLAN.length; bi++) {
+        var bup = G.Upgrades[ASCEND_PLAN[bi][0]];
+        if (bup && bup.bought) { planBought = true; break; }
+      }
+      if ((G.resets || 0) !== (f.run - 1) || planBought) return; // 状態が想定と違うので止めたまま
+      if (G.OnAscend === 1) {
+        f.phase = 'buy'; f.idx = 0; f.stuckReason = '';
+        ascendSaveFlow(f);
+        log('自動昇天: 昇天画面で購入から再開します');
+      } else {
+        var attKey = 'ccauto_ascendAttempts_' + f.run;
+        var att = gmGet(attKey, 0);
+        if (att >= 3) return; // やり直し上限。これ以上は止めたまま報告済みにする
+        gmSet(attKey, att + 1);
+        gmSet('ccauto_ascendFlow', null);
+        log('自動昇天: 昇天が実行されていなかったため、最初からやり直します（' + (att + 1) + '回目）');
+      }
+      return;
+    }
 
     if (f.phase === 'backup') {
       if (gmGet('ccauto_lastSaveRep', 0) > (f.startedAt || 0)) {
         f.phase = 'ascend'; ascendSaveFlow(f);
         log('自動昇天: バックアップ確認OK。昇天します');
+        // このまま下の ascend 処理へ進み、同じ tick で昇天を呼ぶ（再読み込みの隙を減らす）
       } else if (Date.now() - (f.startedAt || 0) > 180000) {
         gmSet('ccauto_ascendFlow', null);
         reportError('自動昇天: バックアップの送信確認ができず中止しました');
+        return;
+      } else {
+        return;
       }
-      return;
     }
     if (f.phase === 'ascend') {
       if (!f.ascendCalled) {
@@ -1832,6 +1859,7 @@ function fmt(n) {
       }
       if ((G.resets || 0) > (f.resetsBefore || 0) && G.OnAscend === 0) {
         f.phase = 'done'; f.completedAt = Date.now(); ascendSaveFlow(f);
+        try { gmSet('ccauto_ascendAttempts_' + f.run, 0); } catch (e) { /* ignore */ }
         try { gmSet('ccauto_ascendLast', { at: f.completedAt, run: f.run, chips: f.chipsAtStart, bought: f.bought, failed: f.failed, skipped: f.skipped, slot: f.slotKitten }); } catch (e) { /* ignore */ }
         log('自動昇天が完了しました（' + f.run + '周目終了、チップ ' + f.chipsAtStart + ' 個、購入 ' + f.bought.length + ' 件、見送り ' + f.skipped.length + ' 件）');
         if (f.failed.length) reportError('自動昇天: 買えなかったものがあります: ' + f.failed.join('、'));
@@ -1868,6 +1896,7 @@ function fmt(n) {
         gmSet('ccauto_ascendFlow', null); // まだ何も始まっていないので破棄してよい
       } else {
         bootFlow.phase = 'stuck';
+        bootFlow.stuckReason = 'reload'; // ascendStep 側で「昇天が実行されていない」と証明できれば復旧する
         ascendSaveFlow(bootFlow);
         reportError('自動昇天の途中で再読み込みされたため、安全のため停止しました');
       }
