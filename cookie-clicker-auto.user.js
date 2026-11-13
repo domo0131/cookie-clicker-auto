@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.10
+// @version      2.3.11
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.10'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.11'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1995,7 +1995,7 @@ function fmt(n) {
     var target = ascendTargetFor(G);
     if (chips < target) return;
     if ((G.resets || 0) >= 1 && !paceFlattened(G, chips, target)) return; // 2周目以降は伸びが鈍ってから
-    if (anyBuffActive()) return; // バフ中は延期（次回判定で再確認）
+    if (anyBuffActive() && chips < target * 1.5) return; // バフ中は延期（次回判定で再確認）。ただし目標の1.5倍を超えたらバフ中でも進める（バフが途切れない状態で待ち続けないため。ユーザー指示 2026-11-14）
     // 事前確認: 購入リストの名前がゲーム内に実在するか（表記違いで買えない事故の再発防止。周回ごとに1回だけ）
     var preKey = 'ccauto_ascendPreflight_' + (G.resets || 0);
     if (!gmGet(preKey, '')) {
