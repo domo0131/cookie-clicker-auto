@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.13
+// @version      2.3.14
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.13'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.14'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1241,6 +1241,10 @@ function fmt(n) {
   // イベントが効いていないと見張りが検知したら、そのセッションはAPIクリックに戻す。
   var bigCookieEl = null;
   var domClickMode = true;
+  // 画面クリックは1回ごとの描画が重く、全部を画面クリックにすると実測が数回/秒まで落ちた。
+  // 数字つきで位置が見える画面クリックは毎秒数回だけにし、残りはAPIクリックで補う（ハイブリッド）
+  var VISUAL_CLICKS_PER_SEC = 4;
+  var visualAcc = 0;
   function clickBigCookie() {
     var G = W.Game;
     if (!domClickMode) { try { G.ClickCookie(); } catch (e) { /* ignore */ } return; }
@@ -1277,7 +1281,11 @@ function fmt(n) {
     applyLightPrefs();
     // 前回tickからの実経過時間ぶんを蓄積する（タイマーのブレや処理の遅れに追随させる）
     var now = Date.now();
-    if (clickLastAt > 0) clickAcc += r * (now - clickLastAt) / 1000;
+    var elapsedMs = clickLastAt > 0 ? (now - clickLastAt) : 0;
+    if (elapsedMs > 0) {
+      clickAcc += r * elapsedMs / 1000;
+      visualAcc = Math.min(8, visualAcc + VISUAL_CLICKS_PER_SEC * elapsedMs / 1000);
+    }
     clickLastAt = now;
     var n = Math.floor(clickAcc);
     if (n <= 0) return;
@@ -1286,7 +1294,11 @@ function fmt(n) {
     var t0 = Date.now();
     var done = 0;
     while (done < n) {
-      try { clickBigCookie(); } catch (e) { break; }
+      try {
+        // 一部だけ画面クリック（数字が見える）、残りはAPIで補って全体の速度を保つ
+        if (visualAcc >= 1) { clickBigCookie(); visualAcc -= 1; }
+        else { W.Game.ClickCookie(); }
+      } catch (e) { break; }
       done++;
       if ((done & 3) === 0 && Date.now() - t0 >= CONFIG.clickBudgetMs) break;
     }
