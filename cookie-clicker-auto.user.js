@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.2.9
+// @version      2.3.0
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.2.9'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.0'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -763,6 +763,7 @@ function fmt(n) {
   function buyStep() {
     if (!state.running || state.mode !== 'auto') return;
     if (!gameReady() || isChallengePage()) return;
+    if (ascendBusy()) return; // 自動昇天の実行中は通常の購入を止める
     // 前回購入の実測検証（ゲーム側の再計算が済んだこのタイミングで照合する）
     if (state.pendingVerify) {
       var pv = state.pendingVerify;
@@ -973,6 +974,7 @@ function fmt(n) {
   function clickStep() {
     if (!state.running) return;
     if (!gameReady() || isChallengePage()) return;
+    if (ascendBusy()) return; // 自動昇天の実行中はクリックも止める
     var r = clickRate();
     if (r <= 0) return;
     applyLightPrefs();
@@ -999,6 +1001,7 @@ function fmt(n) {
   function goldenStep() {
     if (!state.running || !CONFIG.clickGolden) return;
     if (!gameReady() || isChallengePage()) return;
+    if (ascendBusy()) return; // 自動昇天の実行中は黄金クッキーも触らない
     // ホロボア配置中・判定不能のときは黄金クッキーを触らない
     if (holoboreState() !== 'none') return;
     try {
@@ -1163,6 +1166,13 @@ function fmt(n) {
     } catch (e) { /* ignore */ }
     // エラー記録（新しい順・最大10件）を状態に載せる。Muse側のチェッカーが新しいものをチャットへ報告する
     try { status.errors = gmGet('ccauto_errors', []); } catch (e) { /* ignore */ }
+    // 自動昇天の状態（実行中・停止中だけ載せる。Muse側で完了や停止に気づくため）
+    try {
+      var af = gmGet('ccauto_ascendFlow', null);
+      if (af && af.phase && af.phase !== 'done') {
+        status.ascend = { phase: af.phase, run: af.run, bought: (af.bought || []).length, failed: af.failed || [], skipped: af.skipped || [] };
+      }
+    } catch (e) { /* ignore */ }
     // 30分に1回、セーブコードを状態に同梱する（Drive経由でMuse側に保管される）。
     // 送信成功が確認できるまで pending として保持し、毎回の送信に同梱し続ける
     try {
@@ -1568,6 +1578,7 @@ function fmt(n) {
   }
   function checkForUpdate() {
     if (!gameReady() || isChallengePage()) return;
+    if (ascendBusy()) return; // 自動昇天の途中で再読み込みしない
     if (typeof GM_xmlhttpRequest !== 'function') return;
     GM_xmlhttpRequest({
       method: 'GET',
@@ -1596,6 +1607,242 @@ function fmt(n) {
     });
   }
 
+  /* ---------------- 自動昇天（v2.3.0、ユーザー指示で自動化） ----------------
+     流れ: バックアップ確定 → Game.Ascend(1) → 天界アップグレードを固定順に購入 →
+     Permanent upgrade slot I に一番高い所有子猫を設定 → Game.Reincarnate(1)。
+     状態は GM に永続化し、途中で再読み込みされたら二重実行せず「停止中」として報告する。
+     画面判定は Game.OnAscend / Game.AscendTimer を使う（Game.ascensionMode は
+     チャレンジモードの区別用なので使わない。ChatGPT相談 2026-11-13 の指摘に基づく）。 */
+
+  // 購入順（名前, チップ費用の目安）。実際の費用は実行時に basePrice で照合する
+  var ASCEND_PLAN = [
+    ['Legacy', 1], ['Heavenly cookies', 3], ['How to bake your dragon', 9],
+    ['Box of Brand Biscuits', 25], ['Tin of British Tea Biscuits', 25],
+    ['Box of Macarons', 25], ['Tin of Butter Cookies', 25],
+    ['Starter kit', 50], ['Heavenly luck', 77], ['Permanent upgrade slot I', 100],
+    ['Heralds', 100], ['Persistent memory', 500], ['Lasting fortune', 777]
+  ];
+  // 周回ごとの発動チップ数（その周回で新規に獲得するチップ数）。4周目以降は計画の未購入分の合計
+  var ASCEND_TARGETS = { 1: 940, 2: 2185, 3: 12301 };
+
+  function ascendFlow() {
+    try { var f = gmGet('ccauto_ascendFlow', null); return (f && f.phase) ? f : null; } catch (e) { return null; }
+  }
+  function ascendSaveFlow(f) { try { gmSet('ccauto_ascendFlow', f); } catch (e) { /* ignore */ } }
+  function ascendBusy() {
+    var f = ascendFlow();
+    if (f && f.phase !== 'done' && f.phase !== 'stuck') return true;
+    try { if (W.Game && W.Game.OnAscend === 1) return true; } catch (e) { /* ignore */ }
+    return false;
+  }
+  function chipsThisRun(G) {
+    var t = 0;
+    try { t = G.cookiesEarned || 0; } catch (e) { t = 0; }
+    return Math.floor(Math.cbrt(Math.max(0, t) / 1e12));
+  }
+  function ascendTargetFor(G) {
+    var run = (G.resets || 0) + 1;
+    if (ASCEND_TARGETS[run]) return ASCEND_TARGETS[run];
+    var sum = 0;
+    for (var i = 0; i < ASCEND_PLAN.length; i++) {
+      var up = G.Upgrades[ASCEND_PLAN[i][0]];
+      if (up && !up.bought) sum += ASCEND_PLAN[i][1];
+    }
+    return Math.max(940, sum);
+  }
+  function sampleChips(G, chips) {
+    var now = Date.now();
+    var arr = [];
+    try { arr = gmGet('ccauto_chipSamples', []); if (!Array.isArray(arr)) arr = []; } catch (e) { arr = []; }
+    if (arr.length && now - arr[arr.length - 1].ts < 60000) return arr;
+    arr.push({ ts: now, chips: chips, resets: G.resets || 0 });
+    arr = arr.filter(function (s) { return s.resets === (G.resets || 0); }).slice(-90);
+    try { gmSet('ccauto_chipSamples', arr); } catch (e) { /* ignore */ }
+    return arr;
+  }
+  function paceFlattened(G, chips, target) {
+    if (chips >= target * 1.5) return true; // 目標を大きく超えたら待ち続けない
+    var arr = sampleChips(G, chips);
+    var now = Date.now();
+    var old = null;
+    for (var i = 0; i < arr.length; i++) { if (now - arr[i].ts >= 50 * 60000) { old = arr[i]; break; } }
+    if (!old) return false; // 観測が貯まるまでは昇天しない
+    return (chips - old.chips) < chips * 0.05; // 直近の伸びが5%未満なら鈍化とみなす
+  }
+  function ascendStuck(f, msg) {
+    f.phase = 'stuck';
+    ascendSaveFlow(f);
+    reportError('自動昇天を停止しました: ' + msg);
+  }
+  function ascendMaybeStart(G) {
+    if (gmGet('ccauto_autoAscend', '1') !== '1') return;
+    if (!state.running || state.mode !== 'auto') return;
+    if (G.OnAscend === 1 || (G.AscendTimer || 0) > 0) return;
+    // 必要なAPIがそろっているか事前に確認する（無い版では始めない）
+    if (typeof G.Ascend !== 'function' || typeof G.Reincarnate !== 'function' ||
+        typeof G.WriteSave !== 'function' || !G.Upgrades || typeof G.OnAscend === 'undefined') {
+      if (!gmGet('ccauto_ascendApiWarned', '')) {
+        gmSet('ccauto_ascendApiWarned', SCRIPT_VERSION);
+        reportError('自動昇天に必要な仕組みが見つからず、自動昇天は無効です');
+      }
+      return;
+    }
+    var chips = chipsThisRun(G);
+    sampleChips(G, chips);
+    var target = ascendTargetFor(G);
+    if (chips < target) return;
+    if ((G.resets || 0) >= 1 && !paceFlattened(G, chips, target)) return; // 2周目以降は伸びが鈍ってから
+    if (anyBuffActive()) return; // バフ中は延期（次回判定で再確認）
+    var sc = null;
+    try { sc = G.WriteSave(1); } catch (e) { sc = null; }
+    if (!sc || typeof sc !== 'string' || sc.length < 20) {
+      reportError('自動昇天: バックアップが作れず開始しませんでした');
+      return;
+    }
+    gmSet('ccauto_pendingSave', sc);
+    var f = {
+      phase: 'backup', run: (G.resets || 0) + 1, startedAt: Date.now(),
+      bought: [], failed: [], failedNames: [], skipped: [], idx: 0,
+      pendingCheck: '', retries: 0, slotKitten: '', chipsAtStart: chips
+    };
+    ascendSaveFlow(f);
+    log('自動昇天: バックアップの送信確認をしてから昇天します（' + f.run + '周目、チップ ' + chips + ' 個）');
+    try { reportStep(); } catch (e) { /* ignore */ }
+  }
+  function bestKitten(G) {
+    var best = null;
+    try {
+      for (var name in G.Upgrades) {
+        if (!/^Kitten /.test(name)) continue;
+        var up = G.Upgrades[name];
+        if (!up || !up.bought || up.pool === 'prestige') continue;
+        if (!best || (up.basePrice || 0) > (best.basePrice || 0)) best = up;
+      }
+    } catch (e) { /* ignore */ }
+    return best;
+  }
+  function ascendStep() {
+    if (!gameReady() || isChallengePage()) return;
+    var G = W.Game;
+    var f = ascendFlow();
+    if (!f) { ascendMaybeStart(G); return; }
+    if (f.phase === 'done' || f.phase === 'stuck') return;
+
+    if (f.phase === 'backup') {
+      if (gmGet('ccauto_lastSaveRep', 0) > (f.startedAt || 0)) {
+        f.phase = 'ascend'; ascendSaveFlow(f);
+        log('自動昇天: バックアップ確認OK。昇天します');
+      } else if (Date.now() - (f.startedAt || 0) > 180000) {
+        gmSet('ccauto_ascendFlow', null);
+        reportError('自動昇天: バックアップの送信確認ができず中止しました');
+      }
+      return;
+    }
+    if (f.phase === 'ascend') {
+      if (!f.ascendCalled) {
+        f.ascendCalled = 1; f.ascendAt = Date.now(); ascendSaveFlow(f);
+        try { G.Ascend(1); } catch (e) { ascendStuck(f, '昇天の呼び出しでエラー: ' + e); }
+        return;
+      }
+      if (G.OnAscend === 1) {
+        f.phase = 'buy'; f.idx = 0; ascendSaveFlow(f);
+        log('自動昇天: 昇天画面に到達。天界アップグレードを購入します');
+      } else if (Date.now() - (f.ascendAt || 0) > 30000) {
+        ascendStuck(f, '昇天画面に到達できませんでした（転生はしていません）');
+      }
+      return;
+    }
+    if (f.phase === 'buy') {
+      if (f.pendingCheck) {
+        var upc = G.Upgrades[f.pendingCheck];
+        if (upc && upc.bought) { f.bought.push(f.pendingCheck); f.pendingCheck = ''; }
+        else if ((f.retries || 0) < 1) {
+          f.retries = 1; ascendSaveFlow(f);
+          try { if (upc) upc.buy(); } catch (e) { /* ignore */ }
+          return;
+        } else {
+          f.failed.push(f.pendingCheck); f.failedNames.push(f.pendingCheck);
+          f.pendingCheck = ''; f.retries = 0;
+        }
+        ascendSaveFlow(f);
+        return;
+      }
+      if (f.idx >= ASCEND_PLAN.length) {
+        var slotUp = G.Upgrades['Permanent upgrade slot I'];
+        f.phase = (slotUp && slotUp.bought) ? 'slot' : 'reincarnate';
+        ascendSaveFlow(f);
+        return;
+      }
+      var item = ASCEND_PLAN[f.idx]; f.idx++;
+      var name = item[0];
+      var up = G.Upgrades[name];
+      if (!up) { f.failed.push(name + '（未発見）'); f.failedNames.push(name); ascendSaveFlow(f); return; }
+      if (up.bought) { f.bought.push(name); ascendSaveFlow(f); return; }
+      if (up.pool !== 'prestige') { f.failed.push(name + '（対象外）'); f.failedNames.push(name); ascendSaveFlow(f); return; }
+      var parentFailed = false;
+      try {
+        if (up.parents && up.parents.length) {
+          for (var pi = 0; pi < up.parents.length; pi++) {
+            var pn = up.parents[pi] && up.parents[pi].name;
+            if (pn && f.failedNames.indexOf(pn) >= 0) parentFailed = true;
+          }
+        }
+      } catch (e) { /* ignore */ }
+      if (parentFailed) { f.skipped.push(name + '（前提の購入失敗）'); ascendSaveFlow(f); return; }
+      if (typeof up.canBuy === 'function' && !up.canBuy()) { f.skipped.push(name + '（未解放）'); ascendSaveFlow(f); return; }
+      var cost = (typeof up.basePrice === 'number') ? up.basePrice : item[1];
+      if ((G.heavenlyChips || 0) < cost) { f.skipped.push(name + '（チップ不足）'); ascendSaveFlow(f); return; }
+      try { up.buy(); } catch (e) {
+        f.failed.push(name); f.failedNames.push(name); ascendSaveFlow(f); return;
+      }
+      f.pendingCheck = name; f.retries = 0; ascendSaveFlow(f);
+      return;
+    }
+    if (f.phase === 'slot') {
+      var kitten = bestKitten(G);
+      if (!kitten) {
+        log('自動昇天: 設定できる子猫アップグレードが無いため、永久スロットは空のまま進みます');
+        f.phase = 'reincarnate'; ascendSaveFlow(f);
+        return;
+      }
+      if (G.permanentUpgrades && G.permanentUpgrades[0] === kitten.id) {
+        f.slotKitten = kitten.name; f.phase = 'reincarnate'; ascendSaveFlow(f);
+        log('自動昇天: 永久スロットに ' + kitten.name + ' を設定しました');
+        return;
+      }
+      if (!f.slotTried) {
+        f.slotTried = 1; ascendSaveFlow(f);
+        try { if (typeof G.PutUpgradeInPermanentSlot === 'function') G.PutUpgradeInPermanentSlot(kitten.id, 0); } catch (e) { /* ignore */ }
+        return;
+      }
+      try { if (G.permanentUpgrades) G.permanentUpgrades[0] = kitten.id; } catch (e) { /* ignore */ }
+      if (G.permanentUpgrades && G.permanentUpgrades[0] === kitten.id) {
+        f.slotKitten = kitten.name; f.phase = 'reincarnate'; ascendSaveFlow(f);
+        log('自動昇天: 永久スロットに ' + kitten.name + ' を設定しました');
+      } else {
+        ascendStuck(f, '永久スロットの設定に失敗したため、昇天画面で停止しました（転生はしていません）');
+      }
+      return;
+    }
+    if (f.phase === 'reincarnate') {
+      if (!f.reinCalled) {
+        f.reinCalled = 1; f.reinAt = Date.now(); f.resetsBefore = G.resets || 0; ascendSaveFlow(f);
+        try { G.Reincarnate(1); } catch (e) { ascendStuck(f, '転生の呼び出しでエラー: ' + e); }
+        return;
+      }
+      if ((G.resets || 0) > (f.resetsBefore || 0) && G.OnAscend === 0) {
+        f.phase = 'done'; f.completedAt = Date.now(); ascendSaveFlow(f);
+        try { gmSet('ccauto_ascendLast', { at: f.completedAt, run: f.run, chips: f.chipsAtStart, bought: f.bought, failed: f.failed, skipped: f.skipped, slot: f.slotKitten }); } catch (e) { /* ignore */ }
+        log('自動昇天が完了しました（' + f.run + '周目終了、チップ ' + f.chipsAtStart + ' 個、購入 ' + f.bought.length + ' 件、見送り ' + f.skipped.length + ' 件）');
+        if (f.failed.length) reportError('自動昇天: 買えなかったものがあります: ' + f.failed.join('、'));
+        try { reportStep(); } catch (e) { /* ignore */ }
+      } else if (Date.now() - (f.reinAt || 0) > 30000) {
+        ascendStuck(f, '転生の完了を確認できませんでした');
+      }
+      return;
+    }
+  }
+
   /* ---------------- 起動 ---------------- */
 
   function boot() {
@@ -1614,10 +1861,22 @@ function fmt(n) {
       gmSet('ccauto_pendingVerify', '');
       reportError('購入の検証が未完了のまま再読み込みされました（購入は継続します）');
     }
+    // 自動昇天の途中で再読み込みされた場合は、二重実行を避けて安全側に倒す
+    var bootFlow = ascendFlow();
+    if (bootFlow && bootFlow.phase !== 'done' && bootFlow.phase !== 'stuck') {
+      if (bootFlow.phase === 'backup') {
+        gmSet('ccauto_ascendFlow', null); // まだ何も始まっていないので破棄してよい
+      } else {
+        bootFlow.phase = 'stuck';
+        ascendSaveFlow(bootFlow);
+        reportError('自動昇天の途中で再読み込みされたため、安全のため停止しました');
+      }
+    }
 
     sampleClicks();
     setInterval(sampleClicks, 1000);
     setInterval(buyStep, CONFIG.buyIntervalMs);
+    setInterval(ascendStep, 2000);
     setInterval(goldenStep, 1500);
     setInterval(renderPanel, 5000);
     setInterval(function () { gmSet('ccauto_lastBeat', Date.now()); }, 30000);
