@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.2
+// @version      2.3.3
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.2'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.3'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1617,11 +1617,19 @@ function fmt(n) {
   // 購入順（名前, チップ費用の目安）。実際の費用は実行時に basePrice で照合する
   var ASCEND_PLAN = [
     ['Legacy', 1], ['Heavenly cookies', 3], ['How to bake your dragon', 9],
-    ['Box of Brand Biscuits', 25], ['Tin of British Tea Biscuits', 25],
-    ['Box of Macarons', 25], ['Tin of Butter Cookies', 25],
+    ['Box of brand biscuits', 25], ['Tin of British tea biscuits', 25],
+    ['Box of macarons', 25], ['Tin of butter cookies', 25],
     ['Starter kit', 50], ['Heavenly luck', 77], ['Permanent upgrade slot I', 100],
     ['Heralds', 100], ['Persistent memory', 500], ['Lasting fortune', 777]
   ];
+  // 名前の大文字小文字の表記ゆれで「未発見」にならないよう、小文字化して照合する
+  function findUpgrade(G, name) {
+    if (!G.Upgrades) return null;
+    if (G.Upgrades[name]) return G.Upgrades[name];
+    var low = ('' + name).toLowerCase();
+    for (var k in G.Upgrades) { if (('' + k).toLowerCase() === low) return G.Upgrades[k]; }
+    return null;
+  }
   // 周回ごとの発動チップ数（その周回で新規に獲得するチップ数）。4周目以降は計画の未購入分の合計
   var ASCEND_TARGETS = { 1: 940, 2: 2185, 3: 12301 };
 
@@ -1645,7 +1653,7 @@ function fmt(n) {
     if (ASCEND_TARGETS[run]) return ASCEND_TARGETS[run];
     var sum = 0;
     for (var i = 0; i < ASCEND_PLAN.length; i++) {
-      var up = G.Upgrades[ASCEND_PLAN[i][0]];
+      var up = findUpgrade(G, ASCEND_PLAN[i][0]);
       if (up && !up.bought) sum += ASCEND_PLAN[i][1];
     }
     return Math.max(940, sum);
@@ -1735,7 +1743,7 @@ function fmt(n) {
           !(!f.stuckReason && !(f.bought || []).length && !(f.failed || []).length && !(f.skipped || []).length)) return;
       var planBought = false;
       for (var bi = 0; bi < ASCEND_PLAN.length; bi++) {
-        var bup = G.Upgrades[ASCEND_PLAN[bi][0]];
+        var bup = findUpgrade(G, ASCEND_PLAN[bi][0]);
         if (bup && bup.bought) { planBought = true; break; }
       }
       if ((G.resets || 0) !== (f.run - 1) || planBought) return; // 状態が想定と違うので止めたまま
@@ -1783,7 +1791,7 @@ function fmt(n) {
     }
     if (f.phase === 'buy') {
       if (f.pendingCheck) {
-        var upc = G.Upgrades[f.pendingCheck];
+        var upc = findUpgrade(G, f.pendingCheck);
         if (upc && upc.bought) { f.bought.push(f.pendingCheck); f.pendingCheck = ''; }
         else if ((f.retries || 0) < 1) {
           f.retries = 1; ascendSaveFlow(f);
@@ -1797,14 +1805,14 @@ function fmt(n) {
         return;
       }
       if (f.idx >= ASCEND_PLAN.length) {
-        var slotUp = G.Upgrades['Permanent upgrade slot I'];
+        var slotUp = findUpgrade(G, 'Permanent upgrade slot I');
         f.phase = (slotUp && slotUp.bought) ? 'slot' : 'reincarnate';
         ascendSaveFlow(f);
         return;
       }
       var item = ASCEND_PLAN[f.idx]; f.idx++;
       var name = item[0];
-      var up = G.Upgrades[name];
+      var up = findUpgrade(G, name);
       if (!up) { f.failed.push(name + '（未発見）'); f.failedNames.push(name); ascendSaveFlow(f); return; }
       if (up.bought) { f.bought.push(name); ascendSaveFlow(f); return; }
       if (up.pool !== 'prestige') { f.failed.push(name + '（対象外）'); f.failedNames.push(name); ascendSaveFlow(f); return; }
@@ -1840,17 +1848,14 @@ function fmt(n) {
         return;
       }
       if (!f.slotTried) {
-        f.slotTried = 1; ascendSaveFlow(f);
-        try { if (typeof G.PutUpgradeInPermanentSlot === 'function') G.PutUpgradeInPermanentSlot(kitten.id, 0); } catch (e) { /* ignore */ }
+        f.slotTried = 1;
+        // 選択画面を開く方式は画面が開いたまま残ってしまうため、内部状態へ直接設定して次tickで検証する
+        try { if (G.permanentUpgrades) G.permanentUpgrades[0] = kitten.id; } catch (e) { /* ignore */ }
+        ascendSaveFlow(f);
         return;
       }
-      try { if (G.permanentUpgrades) G.permanentUpgrades[0] = kitten.id; } catch (e) { /* ignore */ }
-      if (G.permanentUpgrades && G.permanentUpgrades[0] === kitten.id) {
-        f.slotKitten = kitten.name; f.phase = 'reincarnate'; ascendSaveFlow(f);
-        log('自動昇天: 永久スロットに ' + kitten.name + ' を設定しました');
-      } else {
-        ascendStuck(f, '永久スロットの設定に失敗したため、昇天画面で停止しました（転生はしていません）');
-      }
+      // 直接設定でも一致しなければ、無理に進めず昇天画面で止める
+      ascendStuck(f, '永久スロットの設定に失敗したため、昇天画面で停止しました（転生はしていません）');
       return;
     }
     if (f.phase === 'reincarnate') {
