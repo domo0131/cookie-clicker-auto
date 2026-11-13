@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.6
+// @version      2.3.7
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.6'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.7'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -269,6 +269,12 @@ function fmt(n) {
 
   // 全体系の評価対象は「純粋な倍率系」だけに限定する（ホワイトリスト方式）。
   // 卵・研究・天上系など特殊な仕組みを持つものは、名前でも明示的に弾く（二重の安全）。
+  // ゴールデンクッキー系の強化（出現頻度・効果時間）。効果は CpS/クリックの再計算では測れないため、
+  // 個別指定で候補に入れ、見なし増産で順位付けする（自動でゴールデンクッキーを拾う運用が前提）。
+  // 効果を検証できないので、購入後の検証は記録しない（noVerify）。
+  var GC_BOOSTER_NAMES = ['lucky day', 'serendipity', 'get lucky'];
+  var GC_BOOSTER_GAIN_RATE = 0.25; // 順位付け用の見なし増産率（現在の CpS の25%相当とみなす）
+
   // 全体系アップグレードの候補判定。名前のパターンでは判定しない。
   // （名前に "heavenly" と付く通常ショップ品を天上品と誤認し、名声解放の5つを買い逃した事故の教訓。v2.3.6）
   // ふるいはゲーム側の分類（pool）と、危険な仕組みの明示的な禁止リスト（isBlockedUpgrade、先に判定される）だけ。
@@ -549,6 +555,17 @@ function fmt(n) {
       if (!tie) {
         // 全体系は、ゲーム側の分類で対象外のものを除き、ゲーム本体の再計算で実測して評価する
         if (!isGlobalAdmissible(up)) continue;
+        // ゴールデンクッキー系は再計算で測れないので、見なし増産で回収順位に混ぜる
+        if (GC_BOOSTER_NAMES.indexOf((up.name || '').toLowerCase()) >= 0) {
+          var gbGain = cpsNow * GC_BOOSTER_GAIN_RATE;
+          if (!(gbGain > 0)) continue;
+          var gbPrice = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice;
+          out.push({
+            kind: 'upgrade', ref: up, label: up.name,
+            price: gbPrice, gain: gbGain, payback: gbPrice / gbGain, noVerify: true
+          });
+          continue;
+        }
         var gGain = simulatedUpgradeGain(up, cpsNow);
         if (!(gGain > 0)) continue; // CpS・クリック値に効かないもの（研究解放など）は買わない
         var gPrice = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice;
@@ -677,14 +694,17 @@ function fmt(n) {
     try { prodBefore = readProduction(); } catch (e) { /* ignore */ }
     var cpsBefore = prodBefore ? prodBefore.cps : 0;
     var clickBefore = prodBefore ? prodBefore.click : 0;
+    var writeVerify = !cand.noVerify; // 効果を再計算で検証できない購入（ゴールデンクッキー系）は検証を記録しない
     try {
       if (cand.kind === 'building') {
         var before = cand.ref.amount;
         cand.ref.buy(1);
         if (cand.ref.amount > before) {
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
-          state.pendingVerify = { label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
-          gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
+          if (writeVerify) {
+            state.pendingVerify = { label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
+            gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
+          }
           if (!quiet) {
             log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
             reportStep();
@@ -695,8 +715,10 @@ function fmt(n) {
         cand.ref.buy();
         if (cand.ref.bought) {
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
-          state.pendingVerify = { label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
-          gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
+          if (writeVerify) {
+            state.pendingVerify = { label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
+            gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
+          }
           if (!quiet) {
             log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
             reportStep();
