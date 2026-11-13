@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.8
+// @version      2.3.9
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.8'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.9'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -280,22 +280,48 @@ function fmt(n) {
      正規化しながら貯める。評価時は「正規化した収入率 × 現在の素の CpS」で増産に換算する。
      構成（周回数とGC系の所有状況）が変わったら別の区切りとして測り直す。 */
   var gcTel = (function () {
-    try { var v = gmGet('ccauto_gcTel', null); if (v && typeof v.secs === 'number') return v; } catch (e) { /* ignore */ }
-    return { fp: '', secs: 0, buffNorm: 0, instNorm: 0, clicks: 0, announced: 0 };
+    try {
+      var v = gmGet('ccauto_gcTel', null);
+      if (v && typeof v.secs === 'number') {
+        if (typeof v.buffSolo !== 'number') { v.buffSolo = v.buffNorm || 0; v.buffMulti = 0; } // v2.3.8形式からの移行
+        return v;
+      }
+    } catch (e) { /* ignore */ }
+    return { fp: '', secs: 0, buffSolo: 0, buffMulti: 0, instNorm: 0, clicks: 0, announced: 0 };
   })();
+  // GC系の所有状況だけを区切りにする（昇天では区切らない: 正規化した収入率は周回をまたいで使える）
   function gcFingerprint(G) {
-    var s = '' + (G.resets || 0) + '|';
+    var s = '';
     for (var i = 0; i < GC_BOOSTER_NAMES.length; i++) {
       var u = findUpgrade(G, GC_BOOSTER_NAMES[i]);
       s += (u && u.bought) ? '1' : '0';
     }
     return s;
   }
+  // 所有状況が変わったら、計測を捨てずに「効果が約2倍/半分になる」分だけ換算して引き継ぐ
+  function gcRescale(oldFp, newFp) {
+    if (!oldFp || oldFp.length !== newFp.length) return;
+    for (var i = 0; i < GC_BOOSTER_NAMES.length; i++) {
+      var o = oldFp.charAt(i), n = newFp.charAt(i);
+      if (o === n) continue;
+      var isDur = (GC_BOOSTER_NAMES[i] === 'get lucky');
+      if (n === '1') { // 買った
+        if (isDur) { gcTel.buffSolo *= 2; gcTel.buffMulti *= 2; }
+        else gcTel.secs = Math.max(1, gcTel.secs / 2);
+      } else { // 昇天で失った
+        if (isDur) { gcTel.buffSolo /= 2; gcTel.buffMulti /= 2; }
+        else gcTel.secs *= 2;
+      }
+    }
+  }
   function sampleGcIncome() {
     var G = W.Game;
     if (!state.running || ascendBusy()) return;
     var fp = gcFingerprint(G);
-    if (gcTel.fp !== fp) gcTel = { fp: fp, secs: 0, buffNorm: 0, instNorm: 0, clicks: 0, announced: 0 };
+    if (gcTel.fp !== fp) {
+      if (gcTel.secs > 0 && gcTel.fp) { gcRescale(gcTel.fp, fp); gcTel.fp = fp; }
+      else gcTel = { fp: fp, secs: 0, buffSolo: 0, buffMulti: 0, instNorm: 0, clicks: 0, announced: 0 };
+    }
     var base = 0, finalCps = 0, mc = 1;
     try {
       base = (typeof G.cookiesPsRaw === 'number') ? G.cookiesPsRaw : 0;
@@ -307,9 +333,14 @@ function fmt(n) {
     var clickNow = 0, clickBase = 0;
     try { clickNow = mouseCps(); clickBase = mc > 0 ? clickNow / mc : clickNow; } catch (e) { clickNow = 0; clickBase = 0; }
     var extra = Math.max(0, finalCps - base) + clickRate() * Math.max(0, clickNow - clickBase);
-    gcTel.buffNorm += extra / base;
+    if (extra > 0) {
+      // バフ同士の重なり具合も分かるよう、同時に効いているバフの数で分けて貯める
+      var nBuffs = 0;
+      try { nBuffs = Object.keys(G.buffs || {}).length; } catch (e) { nBuffs = 1; }
+      if (nBuffs >= 2) gcTel.buffMulti += extra / base; else gcTel.buffSolo += extra / base;
+    }
     gcTel.secs++;
-    if (gcTel.secs % 60 === 0) { try { gmSet('ccauto_gcTel', gcTel); } catch (e) { /* ignore */ } }
+    if (gcTel.secs % 60 === 0) { try { gmSet('ccauto_gcTel', gcTel); gmSet('ccauto_discTel', discTel); } catch (e) { /* ignore */ } }
     if (!gcTel.announced && gcTel.secs >= 300 && gcTel.clicks >= 5) {
       gcTel.announced = 1;
       log('ゴールデンクッキーの収入計測が貯まったため、GC系の評価を実測に切り替えます');
@@ -348,13 +379,82 @@ function fmt(n) {
   function gcBoosterGain(up, cpsNow) {
     var isDuration = ((up.name || '').toLowerCase() === 'get lucky');
     if (gcTel.secs >= 300 && gcTel.clicks >= 5 && cpsNow > 0) {
-      // 頻度系は GC 由来収入の全体、時間系はバフ由来分が、それぞれ約2倍になる分を増産とみなす
-      var rate = (isDuration ? gcTel.buffNorm : (gcTel.buffNorm + gcTel.instNorm)) / gcTel.secs;
-      var g = rate * cpsNow;
+      var buffTotal = (gcTel.buffSolo || 0) + (gcTel.buffMulti || 0);
+      var g;
+      if (isDuration) {
+        // 時間系はバフ由来分が約2倍になる分。さらに、バフ同士が重なっている割合だけ
+        // 「重なりやすくなる」利益を上乗せする（重なり中に得た分の割合で見積もる）
+        var s = buffTotal > 0 ? (gcTel.buffMulti || 0) / buffTotal : 0;
+        g = (buffTotal / gcTel.secs) * (1 + s) * cpsNow;
+      } else {
+        // 頻度系は GC 由来収入の全体が約2倍になる分
+        g = ((buffTotal + (gcTel.instNorm || 0)) / gcTel.secs) * cpsNow;
+      }
       if (g > cpsNow * 3) g = cpsNow * 3; // 暴走防止の上限
       if (g > 0) return g;
     }
     return cpsNow * GC_BOOSTER_GAIN_RATE;
+  }
+
+  /* 価格割引系の計測と評価（v2.3.9）:
+     生産に効かない候補は「買ったことにして他の価格が下がるか」を一度だけ実測し、
+     割引があれば、将来の購入費の節約分（収入×支出割合×割引率）を増産とみなして評価する。 */
+  var discTel = (function () {
+    try { var v = gmGet('ccauto_discTel', null); if (v && typeof v.earned === 'number') return v; } catch (e) { /* ignore */ }
+    return { resets: -1, earned: 0, upSpend: 0, bSpend: 0 };
+  })();
+  var lastEarnedSeen = -1;
+  function sampleSpend() {
+    var G = W.Game;
+    var resets = G.resets || 0;
+    if (discTel.resets !== resets) { discTel = { resets: resets, earned: 0, upSpend: 0, bSpend: 0 }; lastEarnedSeen = -1; }
+    var e = G.cookiesEarned || 0;
+    if (lastEarnedSeen >= 0 && e > lastEarnedSeen) discTel.earned += (e - lastEarnedSeen);
+    lastEarnedSeen = e;
+  }
+  function measureDiscount(G, up) {
+    var sampleUp = null, sampleB = null;
+    try {
+      var store = G.UpgradesInStore || [];
+      for (var i = 0; i < store.length; i++) { if (store[i] && store[i] !== up && !store[i].bought) { sampleUp = store[i]; break; } }
+      for (var bn in G.Objects) { if (G.Objects[bn]) { sampleB = G.Objects[bn]; break; } }
+    } catch (e) { /* ignore */ }
+    if (!sampleUp && !sampleB) return null;
+    var upBefore = 0, bBefore = 0;
+    try { if (sampleUp) upBefore = sampleUp.getPrice(); } catch (e) { upBefore = 0; }
+    try { if (sampleB) bBefore = sampleB.getPrice(); } catch (e) { bBefore = 0; }
+    var res = { up: 0, b: 0 };
+    try {
+      up.bought = 1;
+      var upAfter = 0, bAfter = 0;
+      try { if (sampleUp) upAfter = sampleUp.getPrice(); } catch (e) { upAfter = 0; }
+      try { if (sampleB) bAfter = sampleB.getPrice(); } catch (e) { bAfter = 0; }
+      up.bought = 0;
+      if (upBefore > 0 && upAfter > 0 && upAfter < upBefore) res.up = 1 - upAfter / upBefore;
+      if (bBefore > 0 && bAfter > 0 && bAfter < bBefore) res.b = 1 - bAfter / bBefore;
+    } catch (e) { try { up.bought = 0; } catch (e2) { /* ignore */ } return null; }
+    return res;
+  }
+  function discountValue(up, cpsNow) {
+    var cache = {};
+    try { cache = gmGet('ccauto_discountCache', {}) || {}; } catch (e) { cache = {}; }
+    var d = cache[up.name];
+    if (!d) {
+      d = measureDiscount(W.Game, up);
+      if (!d) return 0;
+      cache[up.name] = d;
+      try { gmSet('ccauto_discountCache', cache); } catch (e) { /* ignore */ }
+    }
+    if (!((d.up || 0) > 0 || (d.b || 0) > 0)) return 0;
+    var income = cpsNow + clickRate() * mouseCps(); // 収入/秒の近似（GC収入を含まない保守側）
+    if (!(income > 0)) return 0;
+    var upShare = 0.25, bShare = 0.75; // 支出割合の計測が貯まるまでの目安
+    var totalSpend = (discTel.upSpend || 0) + (discTel.bSpend || 0);
+    if (discTel.earned > income * 600 && totalSpend > 0) {
+      upShare = discTel.upSpend / totalSpend;
+      bShare = discTel.bSpend / totalSpend;
+    }
+    return income * (upShare * (d.up || 0) + bShare * (d.b || 0));
   }
 
   // 全体系アップグレードの候補判定。名前のパターンでは判定しない。
@@ -649,7 +749,17 @@ function fmt(n) {
           continue;
         }
         var gGain = simulatedUpgradeGain(up, cpsNow);
-        if (!(gGain > 0)) continue; // CpS・クリック値に効かないもの（研究解放など）は買わない
+        if (!(gGain > 0)) {
+          // 生産に効かないものは、価格割引の効果が無いか実測し、あれば節約分を増産とみなして混ぜる
+          var dvGain = discountValue(up, cpsNow);
+          if (!(dvGain > 0)) continue; // 生産・クリック値・価格のどれにも効かないもの（研究解放など）は買わない
+          var dvPrice = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice;
+          out.push({
+            kind: 'upgrade', ref: up, label: up.name,
+            price: dvPrice, gain: dvGain, payback: dvPrice / dvGain, noVerify: true
+          });
+          continue;
+        }
         var gPrice = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice;
         out.push({
           kind: 'upgrade', ref: up, label: up.name,
@@ -782,6 +892,7 @@ function fmt(n) {
         var before = cand.ref.amount;
         cand.ref.buy(1);
         if (cand.ref.amount > before) {
+          discTel.bSpend += cand.price || 0; // 割引系の評価用に支出を記録する
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
           if (writeVerify) {
             state.pendingVerify = { label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
@@ -796,6 +907,7 @@ function fmt(n) {
       } else {
         cand.ref.buy();
         if (cand.ref.bought) {
+          if (cand.kind === 'upgrade') discTel.upSpend += cand.price || 0; else discTel.bSpend += cand.price || 0; // 割引系の評価用に支出を記録する
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
           if (writeVerify) {
             state.pendingVerify = { label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
@@ -825,6 +937,7 @@ function fmt(n) {
       clickSamples.push([now, W.Game.cookieClicks || 0]);
       while (clickSamples.length > 2 && now - clickSamples[0][0] > 30000) clickSamples.shift();
       try { sampleGcIncome(); } catch (e2) { /* ignore */ }
+      try { sampleSpend(); } catch (e3) { /* ignore */ }
     } catch (e) { /* ignore */ }
   }
   function measuredClickRate() {
