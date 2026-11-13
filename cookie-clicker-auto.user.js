@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.5
+// @version      2.3.6
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.5'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.6'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -269,21 +269,17 @@ function fmt(n) {
 
   // 全体系の評価対象は「純粋な倍率系」だけに限定する（ホワイトリスト方式）。
   // 卵・研究・天上系など特殊な仕組みを持つものは、名前でも明示的に弾く（二重の安全）。
-  function isGlobalWhitelisted(up) {
+  // 全体系アップグレードの候補判定。名前のパターンでは判定しない。
+  // （名前に "heavenly" と付く通常ショップ品を天上品と誤認し、名声解放の5つを買い逃した事故の教訓。v2.3.6）
+  // ふるいはゲーム側の分類（pool）と、危険な仕組みの明示的な禁止リスト（isBlockedUpgrade、先に判定される）だけ。
+  // 最終判断はシミュレーション実測に任せ、増産が正のものだけが候補に残る。
+  function isGlobalAdmissible(up) {
     var pool = '';
     try { pool = up.pool || ''; } catch (e) { pool = ''; }
     if (pool === 'tech' || pool === 'toggle' || pool === 'prestige' || pool === 'debug') return false;
     var n = (up.name || '').toLowerCase();
-    // 名声レベル解放の5つは通常ショップの全体系（名声ボーナスを段階的に有効化する）。
-    // 名前に heavenly と付くが天上ショップの品ではないので、下の除外より先に許可する（v2.3.5）
-    if (n === 'heavenly chip secret' || n === 'heavenly cookie stand' || n === 'heavenly bakery' ||
-        n === 'heavenly confectionery' || n === 'heavenly key') return true;
-    if (/egg|research|heavenly|permanent|pledge|covenant|pact/.test(n)) return false;
-    if (pool === 'cookie') return true;                   // フレーバークッキー（全体％系）
-    if (/kitten/.test(n)) return true;                    // 子猫系
-    if (/mouse|finger|ambidextrous/.test(n)) return true; // マウス・指系（クリック値）
-    if (/cookies?$/.test(n)) return true;                 // 全体％クッキー系（〜 cookie / 〜 cookies）
-    return false;
+    if (/egg/.test(n)) return false; // 卵系は測定できない特殊効果が本体なので対象外のまま
+    return true;
   }
 
   // 全体系アップグレード（子猫・全体％・指/マウス系）の効果を、ゲーム本体の再計算で実測する。
@@ -551,8 +547,8 @@ function fmt(n) {
       var tie = up.buildingTie1 || null;
       if (up.buildingTie2) continue; // シナジーは計算式が別（所有数比例）なので、過大評価を避けて対象外
       if (!tie) {
-        // 全体系はホワイトリスト（純粋な倍率系）だけを、ゲーム本体の再計算で実測して評価する
-        if (!isGlobalWhitelisted(up)) continue;
+        // 全体系は、ゲーム側の分類で対象外のものを除き、ゲーム本体の再計算で実測して評価する
+        if (!isGlobalAdmissible(up)) continue;
         var gGain = simulatedUpgradeGain(up, cpsNow);
         if (!(gGain > 0)) continue; // CpS・クリック値に効かないもの（研究解放など）は買わない
         var gPrice = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice;
