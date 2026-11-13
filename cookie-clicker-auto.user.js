@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.4
+// @version      2.3.5
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.4'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.5'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -274,6 +274,10 @@ function fmt(n) {
     try { pool = up.pool || ''; } catch (e) { pool = ''; }
     if (pool === 'tech' || pool === 'toggle' || pool === 'prestige' || pool === 'debug') return false;
     var n = (up.name || '').toLowerCase();
+    // 名声レベル解放の5つは通常ショップの全体系（名声ボーナスを段階的に有効化する）。
+    // 名前に heavenly と付くが天上ショップの品ではないので、下の除外より先に許可する（v2.3.5）
+    if (n === 'heavenly chip secret' || n === 'heavenly cookie stand' || n === 'heavenly bakery' ||
+        n === 'heavenly confectionery' || n === 'heavenly key') return true;
     if (/egg|research|heavenly|permanent|pledge|covenant|pact/.test(n)) return false;
     if (pool === 'cookie') return true;                   // フレーバークッキー（全体％系）
     if (/kitten/.test(n)) return true;                    // 子猫系
@@ -499,6 +503,15 @@ function fmt(n) {
     return unitCpsOf(obj) * gMult * clickBoost;
   }
 
+  // クリック押し上げ倍率: マウス系強化1個につき「1クリック = CpSの1%」が実測クリック速度ぶん収入を押し上げる
+  function clickBoostNow(rate) {
+    var G = W.Game;
+    var mouseOwned = 0;
+    try { for (var mk in G.Upgrades) { if (G.Upgrades[mk].bought && /mouse/i.test(mk)) mouseOwned++; } } catch (e) { mouseOwned = 0; }
+    try { var f104 = G.Upgrades['Fortune #104']; if (f104 && f104.bought) mouseOwned++; } catch (e) { /* ignore */ } // Fortune #104 も同じ+1%
+    return 1 + mouseOwned * 0.01 * (rate || 0);
+  }
+
   function evaluateCandidates() {
     var G = W.Game;
     var out = [];
@@ -513,10 +526,7 @@ function fmt(n) {
     var gMult = (rawSum + flatCps) > 0 ? cpsNow / (rawSum + flatCps) : 1;
     if (!(gMult > 0) || !isFinite(gMult)) gMult = 1;
     // マウス系強化（1クリックにCpSの1%ずつ）は建物系の増産でクリック収入も押し上げるため、その分を gain に含める
-    var mouseOwned = 0;
-    try { for (var mk in G.Upgrades) { if (G.Upgrades[mk].bought && /mouse/i.test(mk)) mouseOwned++; } } catch (e) { mouseOwned = 0; }
-    try { var f104 = G.Upgrades['Fortune #104']; if (f104 && f104.bought) mouseOwned++; } catch (e) { /* ignore */ } // Fortune #104 も同じ+1%
-    var clickBoost = 1 + mouseOwned * 0.01 * measuredClickRate();
+    var clickBoost = clickBoostNow(measuredClickRate());
 
     // 建物
     for (var key in G.Objects) {
@@ -658,6 +668,14 @@ function fmt(n) {
     } catch (eP) { preParts = null; }
     var preRate = 0;
     try { var mr = measuredClickRate(); if (isFinite(mr) && mr > 0) preRate = mr; } catch (eR) { preRate = 0; }
+    // 建物・セットの gain はクリック押し上げ込みの「収入」ベースだが、検証は CpS 分だけで比べる。
+    // 購入時点の clickBoost で割って、CpS 分だけの予測を検証用に持つ（v2.3.5）
+    if (!preParts && (cand.kind === 'building' || cand.kind === 'set') && (cand.gain || 0) > 0) {
+      try {
+        var cbNow = clickBoostNow(preRate);
+        if (cbNow > 0 && isFinite(cbNow)) preParts = { cps: cand.gain / cbNow, click: 0 };
+      } catch (eB) { /* ignore */ }
+    }
     // 購入後検証の物差しは readProduction() に統一する（シミュレーションと同じ読み方）
     var prodBefore = null;
     try { prodBefore = readProduction(); } catch (e) { /* ignore */ }
@@ -791,8 +809,21 @@ function fmt(n) {
       } else if (pv.gain > 0) {
         // 予測値: 内訳があれば購入時速度で組み立て直したもの、なければ購入時に使った gain そのもの
         var predV = pv.gain;
-        if (typeof pv.predCps === 'number' && typeof pv.predClick === 'number' && rateV > 0) {
-          predV = pv.predCps + pv.predClick * rateV;
+        if (typeof pv.predCps === 'number' && typeof pv.predClick === 'number' && (rateV > 0 || isBuildingKind)) {
+          if (isBuildingKind) {
+            // 建物・セットは予測も CpS 分のみで比べる（クリック速度に依存しない）
+            predV = pv.predCps;
+          } else if (rateV > 0) {
+            // アップグレード: クリック値の増分は「CpS増分 × 購入時のクリック比率」でも必ず発生する
+            // （クリック値が CpS 連動のため）。シミュレーションの dclick が取りこぼす場合に備え、
+            // 解析的に求まる分を下限として予測のクリック分に使う（v2.3.5）
+            var predClickEff = pv.predClick;
+            if (pv.predCps > 0 && pv.cpsBefore > 0) {
+              var analyticClick = (pv.clickBefore || 0) / pv.cpsBefore * pv.predCps;
+              if (analyticClick > predClickEff) predClickEff = analyticClick;
+            }
+            predV = pv.predCps + predClickEff * rateV;
+          }
         }
         // 購入と検証のあいだにゴールデンクッキー等の効果が始まった/終わった場合は、測定が信用できないため判定しない
         var buffChanged = pv.buffs != null && buffSignature() !== pv.buffs;
@@ -805,7 +836,10 @@ function fmt(n) {
         // 予測自体が購入前の総生産の3倍を超える場合は、測定条件が崩れた値なので判定しない（記録のみ）
         var predictionInvalid = pv.cpsBefore > 0 && predV > pv.cpsBefore * 3;
         var partsTxt = measParts ? (isBuildingKind ? '［CpS分 ' + fmt(Math.round(measParts.dCps)) + '］' : '［CpS分 ' + fmt(Math.round(measParts.dCps)) + '、クリック分 ' + fmt(Math.round(measParts.dClick)) + '］') : '';
-        if (rateV <= 0) {
+        if (typeof pv.predCps === 'number' && typeof pv.predClick === 'number') {
+          partsTxt += '［予測内訳 CpS ' + fmt(Math.round(pv.predCps)) + '、クリック ' + fmt(Math.round(pv.predClick)) + '］';
+        }
+        if (rateV <= 0 && !(isBuildingKind && typeof pv.predCps === 'number')) {
           // 購入時速度が記録されていない（旧版からの持ち越し等）場合は判定せず、数値だけ残す
           log('検証メモ: ' + pv.label + ' は購入時のクリック速度が無いため判定しませんでした（予測 ' + fmt(Math.round(predV)) + ' → 実測 ' + fmt(Math.round(measured)) + partsTxt + '）');
           state.anomalies = 0;
