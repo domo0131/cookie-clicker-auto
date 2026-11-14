@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.18
+// @version      2.3.19
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.18'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.19'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -78,6 +78,10 @@
     // （購入・クリックは止めない。確認後に有効化する。一度だけ適用）
     try {
       if (!gmGet('ccauto_ascendHold218', 0)) { gmSet('ccauto_autoAscend', '0'); gmSet('ccauto_ascendHold218', 1); }
+    } catch (e) { /* ignore */ }
+    // v2.3.19: 計算の一致確認と新しい昇天条件（実績+20%）の決定が済んだので自動昇天を再開する（一度だけ適用）
+    try {
+      if (!gmGet('ccauto_ascendResume219', 0)) { gmSet('ccauto_autoAscend', '1'); gmSet('ccauto_ascendResume219', 1); }
     } catch (e) { /* ignore */ }
   }
 
@@ -1665,6 +1669,7 @@ function fmt(n) {
       recentLogs: (state.logs || []).slice(0, 15)
     };
     status.scriptVersion = SCRIPT_VERSION;
+    try { status.autoAscend = (gmGet('ccauto_autoAscend', '1') === '1'); } catch (e) { status.autoAscend = false; }
     // 周回（昇天）の記録: 昇天回数・完了した周回の一覧・進行中の周回の状態
     try {
       var runInfo = trackRun(G, status.cps || status.cpsRaw || 0, status.totalEarned || 0);
@@ -2199,13 +2204,20 @@ function fmt(n) {
   function chipsThisRun(G) { return pendingChips(G); }
   function ascendTargetFor(G) {
     var run = (G.resets || 0) + 1;
-    if (ASCEND_TARGETS[run]) return ASCEND_TARGETS[run];
-    var sum = 0;
-    for (var i = 0; i < ASCEND_PLAN.length; i++) {
-      var up = findUpgrade(G, ASCEND_PLAN[i][0]);
-      if (up && !up.bought) sum += ASCEND_PLAN[i][1];
+    var base;
+    if (ASCEND_TARGETS[run]) { base = ASCEND_TARGETS[run]; }
+    else {
+      var sum = 0;
+      for (var i = 0; i < ASCEND_PLAN.length; i++) {
+        var up = findUpgrade(G, ASCEND_PLAN[i][0]);
+        if (up && !up.bought) sum += ASCEND_PLAN[i][1];
+      }
+      base = Math.max(940, sum);
     }
-    return Math.max(940, sum);
+    // 効率条件（ユーザー決定 2026-11-14）: 実績の増加分が現在プレステージの +20% に達することも必要。
+    // 940個だけ（+3.7%程度）では再クライムの手間に見合わないため（ChatGPT相談に基づく）。
+    var rel = Math.ceil(Math.max(0, Math.floor(G.prestige || 0)) * 0.20);
+    return Math.max(base, rel);
   }
   function sampleChips(G, chips) {
     var now = Date.now();
