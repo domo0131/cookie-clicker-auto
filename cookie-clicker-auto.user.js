@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.16
+// @version      2.3.17
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.16'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.17'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -593,14 +593,17 @@ function fmt(n) {
   try { bSimOff = JSON.parse(gmGet('ccauto_bSimOff', '{}') || '{}') || {}; } catch (e) { bSimOff = {}; }
   var bSimFailsBy = {}; // name -> その建物で不一致が連続した回数
   var bGainCache = {}; // name -> {gain, at, ach, cps, bOwned, uOwned}
-  function simulatedBuildingGain(obj, cpsNow) {
+  function simulatedBuildingGain(obj, cpsNow, cnt) {
     var name = obj.name;
+    // cnt > 1 はまとめ買い全体の増産実測用（v2.3.17）。キャッシュ・測定停止・報告には触れず、
+    // きれいに測れたときだけ値を返し、それ以外は 0（呼び出し側が概算に切り替える）
+    var count = (typeof cnt === 'number' && cnt > 1) ? Math.floor(cnt) : 1;
     if (bSimDisabled || bSimOff[name]) return 0;
     var now = Date.now();
     var ach = achievementCount();
     var bOwned = 0, uOwned = 0;
     try { bOwned = W.Game.BuildingsOwned || 0; uOwned = W.Game.UpgradesOwned || 0; } catch (e) { /* ignore */ }
-    var c = bGainCache[name];
+    var c = (count === 1) ? bGainCache[name] : null;
     if (c && c.ach === ach && c.bOwned === bOwned && c.uOwned === uOwned &&
         (now - c.at) < 60000 && c.cps > 0 && Math.abs(cpsNow - c.cps) / c.cps < 0.2) {
       return c.gain;
@@ -626,16 +629,16 @@ function fmt(n) {
       };
       var sum0 = storedSum();
       var failed = false, wild = false;
-      obj.amount = amt0 + 1;
+      obj.amount = amt0 + count;
       // 派生カウンタ（所有建物数）も、そのフェーズの値に合わせてから再計算する（Cursor のボーナス計算が参照するため）
-      try { G.BuildingsOwned = bOwned0 + 1; } catch (e8) { /* ignore */ }
+      try { G.BuildingsOwned = bOwned0 + count; } catch (e8) { /* ignore */ }
       try {
         G.CalculateGains();
         gain = Math.max(0, storedSum() - sum0);
         // あり得ない大きさの増え方は測定が乱れたものとして捨てる（判断に使わない）
         var unit0 = 0;
         try { unit0 = unitCpsOf(obj) || 0; } catch (e6) { unit0 = 0; }
-        if (gain > Math.max(sum0 * 0.25, unit0 * 30)) wild = true;
+        if (gain > Math.max(sum0 * 0.25, unit0 * 30) * count) wild = true;
       } catch (e1) { failed = true; }
       // 復元は「軒数と所有建物数を先に戻してから」再計算する。順序が逆だと、Cursor の
       // Thousand fingers 系ボーナスがずれた値で計算され、stored 値が元に戻らない（v2.2.1の修正）
@@ -669,6 +672,11 @@ function fmt(n) {
           }
         } catch (e4) { badFields.push('exception'); }
       }
+      if (count > 1) {
+        // まとめ買い用の実測はここで確定させる。不一致・実績増加・派生値のずれがあれば使わない
+        if (failed || wild || badFields.length || achJump || lightDrift) return 0;
+        return gain;
+      }
       if (!failed && !wild && !badFields.length && (achJump || lightDrift)) {
         gain = 0;
         log('測定メモ: ' + name + ' の実測は' + (achJump ? '実績増加' : '派生値のずれ') + 'のため概算に切り替えました');
@@ -694,7 +702,7 @@ function fmt(n) {
         bSimFailsBy[name] = 0;
       }
     } catch (e) { gain = 0; }
-    bGainCache[name] = { gain: gain, at: now, ach: ach, cps: cpsNow, bOwned: bOwned, uOwned: uOwned };
+    if (count === 1) bGainCache[name] = { gain: gain, at: now, ach: ach, cps: cpsNow, bOwned: bOwned, uOwned: uOwned };
     return gain;
   }
 
@@ -914,6 +922,60 @@ function fmt(n) {
 
   /* ---------------- 購入の実行 ---------------- */
 
+  // n個まとめ買いの合計価格。ゲーム側の合計価格関数があればそれを使い、無ければ等比級数で近似する
+  function sumPriceFor(obj, unitPrice, n) {
+    try {
+      if (typeof obj.getSumPrice === 'function') {
+        var sp = obj.getSumPrice(n);
+        if (sp > 0 && isFinite(sp)) return sp;
+      }
+    } catch (e) { /* ignore */ }
+    return unitPrice * (Math.pow(1.15, n) - 1) / 0.15;
+  }
+
+  // まとめ買い（v2.3.17）の個数を決める。返り値は 100 / 10 / 1 のいずれか
+  // （節目まで10個未満しか残っていない場合だけ、その残り個数をそのまま返す）。
+  // 線引き: (1) ティア解放の節目（25/50/100…）は絶対に超えない (2) 最後の1個の限界回収期間
+  // （価格×1.15^k ÷ 単位増産）が次善候補の回収期間を超えない (3) 合計価格が所持金に収まる。
+  // capSet > 0 のときはセット目標の残り必要軒数も上限にする（その場合は次善比較を使わない）。
+  function bulkQtyFor(obj, unitPrice, unitPayback, nextBestPayback, capSet, bank) {
+    var amt = obj.amount || 0;
+    var cap = 100;
+    var TIERS = [1, 5, 25, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600];
+    for (var i = 0; i < TIERS.length; i++) {
+      if (TIERS[i] > amt) { cap = Math.min(cap, TIERS[i] - amt); break; }
+    }
+    if (capSet && capSet > 0) cap = Math.min(cap, Math.floor(capSet));
+    if (!(capSet && capSet > 0) && unitPayback > 0 && isFinite(nextBestPayback)) {
+      if (nextBestPayback <= unitPayback) return 1;
+      var run = Math.floor(Math.log(nextBestPayback / unitPayback) / Math.log(1.15)) + 1;
+      cap = Math.min(cap, Math.max(1, run));
+    }
+    if (!(cap > 1)) return 1;
+    var ladder = [100, 10];
+    for (var j = 0; j < ladder.length; j++) {
+      var q = ladder[j];
+      if (q <= cap && sumPriceFor(obj, unitPrice, q) <= bank) return q;
+    }
+    // 節目まであと少し（10未満）なら、節目ちょうどまでを1回で買う
+    if (cap < 10 && sumPriceFor(obj, unitPrice, cap) <= bank) return cap;
+    return 1;
+  }
+
+  // 建物を qty 個買う。買えた個数を返す（0 = 買えなかった）。
+  // buy(個数) はゲーム本体の一括購入（価格は等比級数の合計）。Game.buyBulk には触れない
+  // （プレイヤーの店舗設定そのものなので、書き換えると表示や手動操作と競合するため）。
+  // 売却モード（buyMode !== 1）のときは誤って売却しないよう買わない。
+  // 予定より少なく買えた場合は追わず、実個数を返す（次の判断で再評価される）。
+  function buyBuildingUnits(obj, qty) {
+    var G = W.Game;
+    try { if (typeof G.buyMode === 'number' && G.buyMode !== 1) return 0; } catch (e) { /* ignore */ }
+    var before = obj.amount || 0;
+    try { obj.buy(qty); } catch (e) { /* ignore */ }
+    var got = (obj.amount || 0) - before;
+    return got > 0 ? got : 0;
+  }
+
   function doBuy(cand, quiet) {
     var G = W.Game;
     var bankBefore = G.cookies;
@@ -938,6 +1000,16 @@ function fmt(n) {
         if (cbNow > 0 && isFinite(cbNow)) preParts = { cps: cand.gain / cbNow, click: 0 };
       } catch (eB) { /* ignore */ }
     }
+    // まとめ買い（v2.3.17）: バッチ全体の増産を実測し、検証用の予測にする。
+    // 実測できなければ単位予測×個数の概算に切り替える（購入自体は止めない）
+    var bulkQty = (cand.kind === 'building' && typeof cand.qty === 'number' && cand.qty > 1) ? Math.floor(cand.qty) : 1;
+    var bulkPredCps = null;
+    if (bulkQty > 1) {
+      var bSimGain = 0;
+      try { bSimGain = simulatedBuildingGain(cand.ref, baseCps(), bulkQty); } catch (eS) { bSimGain = 0; }
+      if (bSimGain > 0) bulkPredCps = bSimGain;
+      else if (preParts && preParts.cps > 0) bulkPredCps = preParts.cps * bulkQty;
+    }
     // 購入後検証の物差しは readProduction() に統一する（シミュレーションと同じ読み方）
     var prodBefore = null;
     try { prodBefore = readProduction(); } catch (e) { /* ignore */ }
@@ -946,24 +1018,41 @@ function fmt(n) {
     var writeVerify = !cand.noVerify; // 効果を再計算で検証できない購入（ゴールデンクッキー系）は検証を記録しない
     try {
       if (cand.kind === 'building') {
-        var before = cand.ref.amount;
-        cand.ref.buy(1);
-        if (cand.ref.amount > before) {
-          discTel.bSpend += cand.price || 0; // 割引系の評価用に支出を記録する
+        var gotQty = buyBuildingUnits(cand.ref, bulkQty);
+        if (gotQty > 0) {
+          // 割引系の評価用に支出を記録する（まとめ買いは実際の所持金減少で数える）
+          discTel.bSpend += (bulkQty > 1) ? Math.max(0, bankBefore - G.cookies) : (cand.price || 0);
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
+          if (bulkQty > 1 && gotQty < bulkQty) {
+            log('まとめ買いメモ: ' + cand.ref.name + ' は ' + bulkQty + ' 個の予定で ' + gotQty + ' 個になりました（残りは次の判断で再評価します）');
+          }
           if (writeVerify) {
-            state.pendingVerify = { label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
+            var pvLabel = cand.label, pvGain = cand.gain || 0;
+            var pvPredCps = preParts ? preParts.cps : null, pvPredClick = preParts ? preParts.click : null;
+            if (bulkQty > 1) {
+              pvLabel = cand.ref.name + ' ×' + gotQty;
+              if (bulkPredCps !== null) {
+                pvPredCps = bulkPredCps * gotQty / bulkQty;
+                var cbB = 1;
+                try { cbB = clickBoostNow(preRate); if (!(cbB > 0) || !isFinite(cbB)) cbB = 1; } catch (eCB) { cbB = 1; }
+                pvGain = pvPredCps * cbB;
+                pvPredClick = 0;
+              } else {
+                pvGain = (cand.gain || 0) * gotQty;
+              }
+            }
+            state.pendingVerify = { label: pvLabel, kind: cand.kind, gain: pvGain, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: pvPredCps, predClick: pvPredClick };
             gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
           }
           if (!quiet) {
             log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
             reportStep();
           }
-          return true;
+          return gotQty;
         }
       } else {
         cand.ref.buy();
-        if (cand.ref.bought) {
+        if (cand.ref.bought) { // アップグレード系は常に1件（doBuy の返り値は購入個数）
           if (cand.kind === 'upgrade') discTel.upSpend += cand.price || 0; else discTel.bSpend += cand.price || 0; // 割引系の評価用に支出を記録する
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
           if (writeVerify) {
@@ -974,7 +1063,7 @@ function fmt(n) {
             log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
             reportStep();
           }
-          return true;
+          return 1;
         }
       }
     } catch (e) { /* 失敗しても次周期で再評価 */ }
@@ -1210,7 +1299,26 @@ function fmt(n) {
       } else if (pick.kind === 'building') {
         countKey = pick.ref.name;
       }
-      if (!doBuy(buyCand, true)) break;
+      // まとめ買い（v2.3.17）: 建物は条件が合えば ×100 / ×10 で一気に買う。
+      // 対象は「効率1位の建物がそのまま買える場合」と「セット目標の買い進め」だけ。
+      // 順序比較で割り込む合間の候補は、Aを買うタイミングの計算がずれるため従来通り1個ずつ
+      if (buyCand.kind === 'building') {
+        var bQty = 1;
+        if (pick.kind === 'set') {
+          bQty = bulkQtyFor(buyCand.ref, buyCand.price, 0, Infinity, (pick.setNeed || 0) - (buyCand.ref.amount || 0), bank);
+        } else if (pick === top) {
+          var nbPay = (ev.list.length > 1 && ev.list[1]) ? ev.list[1].payback : Infinity;
+          bQty = bulkQtyFor(buyCand.ref, buyCand.price, pick.payback, nbPay, 0, bank);
+        } else if (top.kind === 'set' && top.buildingRef && pick.ref === top.buildingRef) {
+          bQty = bulkQtyFor(buyCand.ref, buyCand.price, 0, Infinity, (top.setNeed || 0) - (buyCand.ref.amount || 0), bank);
+        }
+        if (bQty > 1) {
+          var unitPriceB = buyCand.price;
+          buyCand = { kind: 'building', ref: buyCand.ref, label: buyCand.label, gain: buyCand.gain, payback: buyCand.payback, qty: bQty, price: sumPriceFor(buyCand.ref, unitPriceB, bQty) };
+        }
+      }
+      var boughtN = doBuy(buyCand, true);
+      if (!boughtN) break;
       // 第1目標とは違うものを買ったら「目標までの間に買ったもの」として残す（目標そのものを買ったら消す）
       if (pick.label !== top.label) {
         state.lastInterim = { label: (pick.kind === 'set' ? buyCand.label : pick.label), price: Math.round(buyCand.price), at: Date.now(), goal: top.label };
@@ -1221,7 +1329,7 @@ function fmt(n) {
       }
       boughtTotal++;
       if (!boughtCounts[countKey]) boughtCounts[countKey] = { n: 0, spent: 0 };
-      boughtCounts[countKey].n++;
+      boughtCounts[countKey].n += boughtN;
       boughtCounts[countKey].spent += Math.max(0, bankB - G.cookies);
     }
     if (boughtTotal > 0) {
