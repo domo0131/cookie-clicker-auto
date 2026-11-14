@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.20
+// @version      2.3.21
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -22,7 +22,8 @@
   /* ================= 設定（ここだけ書き換えれば調整できます） ================= */
   var CONFIG = {
     mode: 'readonly',        // 'readonly' = 読み取り専用（買わずに「次に買うもの」だけ表示） / 'auto' = 自動購入する
-    buyIntervalMs: 2000,     // 購入判断の間隔（ミリ秒）
+    buyIntervalMs: 1000,     // 購入判断の間隔（ミリ秒）（v2.3.21: 2000→1000。購入判定と全評価を分離し、評価は evalIntervalMs 間隔で再利用する）
+    evalIntervalMs: 2000,    // 全候補の再評価シミュレーションを行う最小間隔（ミリ秒）。この間は前回評価を使い回す（v2.3.21）
     maxBatch: 1,             // 1回の判断で買う上限数（安全優先: 1件買って実測検証してから次へ）
     clickPerSecond: 2,       // 大クッキーの自動クリック回数/秒（0で無効）
     clickGolden: true,       // 黄金クッキーを自動でクリックするか（ホロボア配置中は設定に関係なく常に停止）
@@ -36,7 +37,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.20'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.21'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -961,14 +962,14 @@ function fmt(n) {
       cap = Math.min(cap, Math.max(1, run));
     }
     if (!(cap > 1)) return 1;
-    var ladder = [100, 10];
-    for (var j = 0; j < ladder.length; j++) {
-      var q = ladder[j];
-      if (q <= cap && sumPriceFor(obj, unitPrice, q) <= bank) return q;
+    // 上限の範囲で買える最大個数をそのまま1回で買う（v2.3.21、ChatGPT相談）。
+    // 以前は ×100 / ×10 に丸めていたため、端数ぶんが次の判断に持ち越されて購入回数が増えていた。
+    var lo = 1, hi = Math.floor(cap), best = 1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (sumPriceFor(obj, unitPrice, mid) <= bank) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
     }
-    // 節目まであと少し（10未満）なら、節目ちょうどまでを1回で買う
-    if (cap < 10 && sumPriceFor(obj, unitPrice, cap) <= bank) return cap;
-    return 1;
+    return best;
   }
 
   // 建物を qty 個買う。買えた個数を返す（0 = 買えなかった）。
@@ -1050,7 +1051,7 @@ function fmt(n) {
                 pvGain = (cand.gain || 0) * gotQty;
               }
             }
-            state.pendingVerify = { label: pvLabel, kind: cand.kind, gain: pvGain, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: pvPredCps, predClick: pvPredClick };
+            state.pendingVerify = { at: Date.now(), label: pvLabel, kind: cand.kind, gain: pvGain, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: pvPredCps, predClick: pvPredClick };
             gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
           }
           if (!quiet) {
@@ -1065,7 +1066,7 @@ function fmt(n) {
           if (cand.kind === 'upgrade') discTel.upSpend += cand.price || 0; else discTel.bSpend += cand.price || 0; // 割引系の評価用に支出を記録する
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
           if (writeVerify) {
-            state.pendingVerify = { label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
+            state.pendingVerify = { at: Date.now(), label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null };
             gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
           }
           if (!quiet) {
@@ -1147,10 +1148,46 @@ function fmt(n) {
     state.targetPrice = top.price;
   }
 
+  // 評価の再利用（v2.3.21、ChatGPT相談）: 全候補の再計算シミュレーションは重いため、
+  // 「残高だけが増えた」だけの間は前回の評価を使い回し、購入可否と貯金判定だけを新しい残高でやり直す。
+  // 購入・バフ変化・実績変化・建物総数/強化所持数の変化があったら評価を捨て直す。
+  var evalCache = null;
+  function evalSignature() {
+    var G = W.Game;
+    var bTotal = 0, uTotal = 0;
+    try { for (var k in G.Objects) { bTotal += G.Objects[k].amount || 0; } } catch (e) { /* ignore */ }
+    try { uTotal = G.UpgradesOwned || 0; } catch (e) { /* ignore */ }
+    return buffSignature() + '|' + achievementsWon() + '|' + bTotal + '|' + uTotal;
+  }
+  function getEvaluation() {
+    var now = Date.now();
+    if (evalCache && (now - evalCache.at) < CONFIG.evalIntervalMs && evalCache.sig === evalSignature()) {
+      return evalCache.ev;
+    }
+    var ev = evaluateCandidates();
+    evalCache = { at: now, ev: ev, sig: evalSignature() };
+    return ev;
+  }
+
   function buyStep() {
     if (!state.running || state.mode !== 'auto') return;
     if (!gameReady() || isChallengePage()) return;
     if (ascendBusy()) return; // 自動昇天の実行中は通常の購入を止める
+    // 検証の前に、ゲーム本体の再計算が終わっていることを確認する（v2.3.21、ChatGPT相談）。
+    // 再計算フラグが立っている間は測定がぶれるため、短時間だけ検証を持ち越す。
+    // 4秒待っても終わらなければ判定せずに記録を閉じる（購入は止めない）。
+    if (state.pendingVerify) {
+      if (!state.pendingVerify.at) state.pendingVerify.at = Date.now();
+      var recalcOn = false;
+      try { recalcOn = (typeof W.Game.recalculateGains === 'number') && W.Game.recalculateGains !== 0; } catch (e) { recalcOn = false; }
+      if (recalcOn) {
+        if (Date.now() - state.pendingVerify.at < 4000) { renderPanel(); return; }
+        log('検証メモ: ' + state.pendingVerify.label + ' は再計算が終わらないため判定しませんでした');
+        state.pendingVerify = null;
+        gmSet('ccauto_pendingVerify', '');
+        state.anomalies = 0;
+      }
+    }
     // 前回購入の実測検証（ゲーム側の再計算が済んだこのタイミングで照合する）
     if (state.pendingVerify) {
       var pv = state.pendingVerify;
@@ -1243,7 +1280,7 @@ function fmt(n) {
     var boughtTotal = 0;
     // 1回の判断で、回収効率を毎回判定し直しながら最大 maxBatch 個までまとめ買いする
     for (var step = 0; step < CONFIG.maxBatch; step++) {
-      var ev = evaluateCandidates();
+      var ev = getEvaluation();
       if (state.halted) break; // 評価中に異常停止が立ったら、その回の候補では買わない
       if (!ev.list.length) break;
       var bank = G.cookies;
@@ -1328,6 +1365,7 @@ function fmt(n) {
       }
       var boughtN = doBuy(buyCand, true);
       if (!boughtN) break;
+      evalCache = null; // 購入が入ったら評価は捨て直す（次回は必ず再評価）
       // 第1目標とは違うものを買ったら「目標までの間に買ったもの」として残す（目標そのものを買ったら消す）
       if (pick.label !== top.label) {
         state.lastInterim = { label: (pick.kind === 'set' ? buyCand.label : pick.label), price: Math.round(buyCand.price), at: Date.now(), goal: top.label };
