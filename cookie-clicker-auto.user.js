@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.31
+// @version      2.3.32
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.31'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.32'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -131,10 +131,11 @@
   }
   function tabSetRole(primary) {
     var changed = (tabState.primary !== primary) || !tabState.decided;
-    var wasDecided = tabState.decided;
     tabState.primary = primary;
     tabState.decided = true;
-    if (!primary && wasDecided) tabState.wasFollower = true;
+    // 初回から従タブの場合も含め、従になった履歴は必ず残す（v2.3.32、ChatGPTレビュー）。
+    // 履歴がないと、主タブの消滅時に再読み込みなしで昇格し、古いメモリ状態を保存しうる
+    if (!primary) tabState.wasFollower = true;
     try {
       var G = W.Game;
       if (G && G.prefs) {
@@ -171,12 +172,29 @@
   function tabElect() {
     var c = tabClaimRead();
     var now = Date.now();
-    // タブ複製で TAB_ID が重なっていたら、このタブは新しい ID を取り直して選挙し直す（1回だけ）
-    if (c && c.id === TAB_ID && c.nonce && c.nonce !== TAB_NONCE && (now - c.at) < TAB_STALE_MS && !tabIdRegenDone) {
-      tabIdRegenDone = true;
-      TAB_ID = 'tab-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e9).toString(36);
-      try { sessionStorage.setItem('ccauto_tabId', TAB_ID); } catch (e) { /* ignore */ }
-      c = null;
+    // 引き継ぎ再読み込みの直後は、nonce 照合より先に主タブとして復帰する（v2.3.32）。
+    // nonce は読み込みのたびに変わるため、照合を先にすると自分の引き継ぎを完了できない。
+    // ただし別のタブが既に正当に主なら、引き継ぎ記録は破棄して通常の選挙に戻る
+    var hv = null;
+    try { hv = gmGet('ccauto_handover', null); } catch (e) { hv = null; }
+    if (hv && hv.id === TAB_ID && (now - (hv.at || 0)) < 120000) {
+      var otherClaims = !!(c && c.id !== TAB_ID && (now - c.at) < TAB_STALE_MS);
+      handoverTake(); // 記録はどちらに転んでも消費する
+      if (!otherClaims) { tabClaimWrite(); tabSetRole(true); return; }
+      c = tabClaimRead();
+    }
+    // 自分と同じ ID で別個体（nonce違い）の新しい主張がある = タブ複製か自分の再読み込み。
+    // IDだけ取り直し、既存の主張は他者のものとして尊重して従タブになる（v2.3.32）。
+    // 以前は主張を消して即座に横取りしており、複製タブが古い状態のまま主になる穴があった。
+    // 再読み込みの場合は相手がもう居ないので、主張が失効した時点で通常の引き継ぎに入る
+    if (c && c.id === TAB_ID && c.nonce && c.nonce !== TAB_NONCE && (now - c.at) < TAB_STALE_MS) {
+      if (!tabIdRegenDone) {
+        tabIdRegenDone = true;
+        TAB_ID = 'tab-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e9).toString(36);
+        try { sessionStorage.setItem('ccauto_tabId', TAB_ID); } catch (e) { /* ignore */ }
+      }
+      tabSetRole(false);
+      return;
     }
     if (c && c.id !== TAB_ID && (now - c.at) < TAB_STALE_MS) { tabSetRole(false); return; }
     tabClaimWrite();
@@ -188,8 +206,42 @@
       tabSetRole(true);
     }, 1500);
   }
+  // 存在ビーコン（v2.3.32）: 全タブが共有インデックスに自分の {初回検知, 最終観測, 役割}
+  // を書き、主タブが状態送信に載せる。「複数タブが開いているか」「どちらが古いか」を
+  // 通常の送信データから検知できるようにするため（従タブは状態送信をしないので、
+  // これがないと重複に気づけない）。各タブは自分の項目だけを更新する
+  function tabBeacon() {
+    try {
+      var idx = gmGet('ccauto_tabIndex', null);
+      if (!idx || typeof idx !== 'object') idx = {};
+      var now = Date.now();
+      var me = idx[TAB_ID];
+      if (!me || typeof me.first !== 'number') { me = { first: now }; idx[TAB_ID] = me; }
+      me.last = now;
+      me.role = tabState.primary ? 'primary' : (tabState.decided ? 'follower' : 'unknown');
+      me.code = TAB_ID.slice(-4);
+      for (var k in idx) { if (now - ((idx[k] && idx[k].last) || 0) > 15 * 60 * 1000) delete idx[k]; }
+      gmSet('ccauto_tabIndex', idx);
+    } catch (e) { /* ignore */ }
+  }
+  function tabListForPayload() {
+    var out = [];
+    try {
+      var idx = gmGet('ccauto_tabIndex', null);
+      if (idx && typeof idx === 'object') {
+        for (var k in idx) {
+          var e = idx[k];
+          if (e && typeof e.first === 'number') out.push({ code: e.code || String(k).slice(-4), first: e.first, last: e.last || 0, role: e.role || 'unknown' });
+        }
+      }
+    } catch (e2) { /* ignore */ }
+    out.sort(function (a, b) { return a.first - b.first; });
+    return out;
+  }
+
   function tabHeartbeat() {
     if (!tabState.decided) return;
+    tabBeacon();
     if (tabState.primary) {
       // 書き込む前に所有者を照合する: 凍結から復帰した旧主タブ等が、より新しい
       // 主張を持つタブへ譲る（v2.3.30）
@@ -212,7 +264,11 @@
           if (!tabState.primary) return undefined; // 書き込みは主タブだけ
           // 書き込みの直前にも所有者を照合する（v2.3.30）: 凍結から復帰した旧主タブの
           // 最初の自動セーブを、ハートビートを待たずその場で遮断する
-          if (claimIsForeignFresh(tabClaimRead())) { try { tabSetRole(false); } catch (e) { /* ignore */ } return undefined; }
+          var c = tabClaimRead();
+          if (claimIsForeignFresh(c)) { try { tabSetRole(false); } catch (e) { /* ignore */ } return undefined; }
+          // 自分の主張が読み取れて新鮮なときだけ許可する（v2.3.32: fail-closed）。
+          // 主張が消えた・失効した・読めなかった場合は書き込まない（次の自動セーブで再試行される）
+          if (!c || c.id !== TAB_ID || (Date.now() - c.at) >= TAB_STALE_MS) return undefined;
         }
         return orig.apply(this, arguments);
       };
@@ -2035,15 +2091,20 @@ function fmt(n) {
     try {
       var prestigeNow = 0;
       try { prestigeNow = Math.floor(G.prestige || 0); } catch (e) { prestigeNow = 0; }
+      // 全期間累計（リセット分＋今周回分）は正しい進行では単調増加するので、
+      // 同一周回内の巻き戻し（建物・クッキーの消失）の検知にも使う（v2.3.32）
+      var allTimeNow = 0;
+      try { allTimeNow = (G.cookiesReset || 0) + (G.cookiesEarned || 0); } catch (e) { allTimeNow = 0; }
       var cp = null;
       try { cp = gmGet('ccauto_checkpoint', null); } catch (e) { cp = null; }
       if (!cp || typeof cp.resets !== 'number') {
-        try { gmSet('ccauto_checkpoint', { resets: resets, prestige: prestigeNow, at: now }); } catch (e) { /* ignore */ }
+        try { gmSet('ccauto_checkpoint', { resets: resets, prestige: prestigeNow, allTime: allTimeNow, at: now }); } catch (e) { /* ignore */ }
       } else if (resets === 0 && prestigeNow === 0 && cp.resets > 0) {
         // セーブの初期化（ワイプ・新規開始）は新しい系列として扱い、巻き戻しとはみなさない
-        try { gmSet('ccauto_checkpoint', { resets: 0, prestige: 0, at: now }); } catch (e) { /* ignore */ }
+        try { gmSet('ccauto_checkpoint', { resets: 0, prestige: 0, allTime: 0, at: now }); } catch (e) { /* ignore */ }
         try { gmSet('ccauto_rollbackSeen', 0); } catch (e) { /* ignore */ }
-      } else if (resets < cp.resets || (resets === cp.resets && prestigeNow < cp.prestige)) {
+      } else if (resets < cp.resets || (resets === cp.resets && prestigeNow < cp.prestige) ||
+                 (typeof cp.allTime === 'number' && allTimeNow > 0 && allTimeNow < cp.allTime * 0.999)) {
         if (gmGet('ccauto_rollbackSeen', 0) !== 1) {
           gmSet('ccauto_rollbackSeen', 1);
           reportError('セーブの巻き戻しを検知しました（到達済み: 昇天 ' + cp.resets + ' 回／プレステージ ' + cp.prestige + '）。再昇天で追いつくまで記録を保護します（購入は継続します）');
@@ -2053,8 +2114,8 @@ function fmt(n) {
           gmSet('ccauto_rollbackSeen', 0);
           log('巻き戻しから回復しました（記録が到達済みに追いつきました）');
         }
-        if (resets > cp.resets || prestigeNow > cp.prestige) {
-          try { gmSet('ccauto_checkpoint', { resets: resets, prestige: prestigeNow, at: now }); } catch (e) { /* ignore */ }
+        if (resets > cp.resets || prestigeNow > cp.prestige || allTimeNow > (cp.allTime || 0)) {
+          try { gmSet('ccauto_checkpoint', { resets: resets, prestige: prestigeNow, allTime: allTimeNow, at: now }); } catch (e) { /* ignore */ }
         }
       }
     } catch (e) { /* ignore */ }
@@ -2182,6 +2243,7 @@ function fmt(n) {
     status.scriptVersion = SCRIPT_VERSION;
     try { status.autoAscend = (gmGet('ccauto_autoAscend', '1') === '1'); } catch (e) { status.autoAscend = false; }
     try { status.tabRole = tabState.primary ? 'primary' : 'follower'; } catch (e) { /* ignore */ }
+    try { status.tabCode = TAB_ID.slice(-4); status.tabs = tabListForPayload(); } catch (e) { /* ignore */ }
     try { status.ascendEval = effCache ? effCache.data : null; } catch (e) { /* ignore */ }
     try { status.rolledBack = gmGet('ccauto_rollbackSeen', 0) === 1; } catch (e) { /* ignore */ }
     // 永久スロットの中身（v2.3.26: 遠隔確認用。IDをゲーム内定義と照合して名前で載せる）
@@ -2398,6 +2460,7 @@ function fmt(n) {
 
   function reportTest() {
     // 送信の切り分け用：各段階の結果をログに残す（通常の送信は無言）
+    if (!tabState.primary) { log('従タブのため送信テストは実行しません（送信は主タブだけが行います）'); renderPanel(); return; }
     if (reportInFlight) { log('通常の送信が通信中です。少し待ってから試してください'); renderPanel(); return; }
     log('送信テスト開始');
     var url = gmGet('ccauto_reportUrl', '');
@@ -2608,6 +2671,8 @@ function fmt(n) {
     if (ctlEl) ctlEl.style.display = mini ? 'none' : 'block';
     if (expEl) expEl.style.display = mini ? 'inline-block' : 'none';
     if (ttlEl) ttlEl.style.display = mini ? 'none' : 'block';
+    // タブの識別コードと役割を題名に出す（複数タブ時に画面で見分けるため、v2.3.32）
+    if (ttlEl) ttlEl.textContent = '🤖 自動購入パネル（タブ ' + TAB_ID.slice(-4) + (tabState.primary ? '・主' : (tabState.decided ? '・従' : '')) + '）';
     panel.style.maxWidth = mini ? '240px' : '270px';
     var modeLabel = (state.mode === 'auto') ? '自動購入' : '読み取り専用';
     var runLabel = state.halted ? '購入停止中（異常検知）' : (state.running ? '稼働中' : '停止中');
@@ -3473,11 +3538,10 @@ function fmt(n) {
     setInterval(spellStep, 2000);
     setInterval(renderPanel, 5000);
     setInterval(function () {
-      gmSet('ccauto_lastBeat', Date.now());
+      if (tabState.primary) gmSet('ccauto_lastBeat', Date.now()); // 稼働時刻は主タブだけが更新する（v2.3.32）
       // 画面維持ロックがシステム側で外れていたら取り直す（可視状態のときだけ）
       if (gmGet('ccauto_wake', '') !== '0' && !wakeLockObj && !document.hidden) acquireWakeLock();
     }, 30000);
-    gmSet('ccauto_lastBeat', Date.now());
     state.lastReport = gmGet('ccauto_lastReport', '');
     setTimeout(reportStep, 15000);
     setInterval(reportStep, CONFIG.reportIntervalMs);
@@ -3527,6 +3591,9 @@ function fmt(n) {
     try { location.reload(); } catch (e) { /* ignore */ }
   }
   setInterval(loadWatchdog, 5000);
+
+  // セーブ書き込みガードは boot の完了を待たず、ゲームが見えた時点ですぐに設置する（v2.3.32）
+  var guardEarlyTimer = setInterval(function () { if (installSaveGuard()) clearInterval(guardEarlyTimer); }, 250);
 
   if (document.readyState === 'complete' || document.readyState === 'interactive') {
     setTimeout(boot, 3000);
