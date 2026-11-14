@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.32
+// @version      2.3.33
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.32'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.33'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -2244,6 +2244,7 @@ function fmt(n) {
     try { status.autoAscend = (gmGet('ccauto_autoAscend', '1') === '1'); } catch (e) { status.autoAscend = false; }
     try { status.tabRole = tabState.primary ? 'primary' : 'follower'; } catch (e) { /* ignore */ }
     try { status.tabCode = TAB_ID.slice(-4); status.tabs = tabListForPayload(); } catch (e) { /* ignore */ }
+    try { status.heavenLog = gmGet('ccauto_heavenLog', []); } catch (e) { /* ignore */ }
     try { status.ascendEval = effCache ? effCache.data : null; } catch (e) { /* ignore */ }
     try { status.rolledBack = gmGet('ccauto_rollbackSeen', 0) === 1; } catch (e) { /* ignore */ }
     // 永久スロットの中身（v2.3.26: 遠隔確認用。IDをゲーム内定義と照合して名前で載せる）
@@ -2878,6 +2879,16 @@ function fmt(n) {
     return n;
   }
   // 優先順に並べた購入候補の一覧: コア13品目 → 条件を満たしたLucky系 → 永続枠II〜V → その他の未所持（安い順）
+  // 天界アップグレードの効果文（スペースの購入記録用）: ゲーム内の説明から
+  // フレーバーの台詞（<q>…）とタグを取り除いた実用部分だけを残す
+  function heavenDescOf(up) {
+    var d = '';
+    try { d = String((up && up.desc) || ''); } catch (e) { d = ''; }
+    var qi = d.indexOf('<q'); if (qi >= 0) d = d.slice(0, qi);
+    d = d.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+    return d.slice(0, 200);
+  }
+
   function heavenlyCandidates(G, f) {
     var skip = (f && f.planSkip) || [];
     var out = [];
@@ -3395,6 +3406,11 @@ function fmt(n) {
       }
       var cost2 = (typeof up2.basePrice === 'number') ? up2.basePrice : pick.cost;
       if ((G.heavenlyChips || 0) < cost2) { skipFlowItem(f, name2, 'チップ不足'); return; }
+      // 購入明細を控える（スペースの昇天アップグレード記録用、v2.3.33）: 買う直前に名前・価格・効果を記録
+      try {
+        f.boughtDetail = f.boughtDetail || {};
+        f.boughtDetail[name2] = { name: name2, dname: (up2.name && up2.name !== name2) ? String(up2.name) : '', price: cost2, desc: heavenDescOf(up2) };
+      } catch (e) { /* ignore */ }
       try { up2.buy(); } catch (e) {
         f.failed.push(name2); f.failedNames.push(name2);
         f.planSkip = f.planSkip || [];
@@ -3447,6 +3463,20 @@ function fmt(n) {
         f.phase = 'done'; f.completedAt = Date.now(); ascendSaveFlow(f);
         try { gmSet('ccauto_ascendAttempts_' + f.run, 0); } catch (e) { /* ignore */ }
         try { gmSet('ccauto_ascendLast', { at: f.completedAt, run: f.run, chips: f.chipsAtStart, bought: f.bought, failed: f.failed, skipped: f.skipped, slot: f.slotKitten }); } catch (e) { /* ignore */ }
+        // 昇天アップグレードの購入記録を履歴として残す（スペース表示用、v2.3.33。新しい順、直近15回分）
+        try {
+          var hl = gmGet('ccauto_heavenLog', []);
+          if (!Array.isArray(hl)) hl = [];
+          var items = [], spent = 0;
+          for (var bi = 0; bi < (f.bought || []).length; bi++) {
+            var bn = f.bought[bi];
+            var bd = (f.boughtDetail && f.boughtDetail[bn]) || { name: bn, dname: '', price: 0, desc: '' };
+            items.push(bd); spent += (bd.price || 0);
+          }
+          hl.unshift({ run: f.run, at: f.completedAt, spent: spent, bought: items });
+          if (hl.length > 15) hl.length = 15;
+          gmSet('ccauto_heavenLog', hl);
+        } catch (e) { /* ignore */ }
         log('自動昇天が完了しました（' + f.run + '周目終了、チップ ' + f.chipsAtStart + ' 個、購入 ' + f.bought.length + ' 件、見送り ' + f.skipped.length + ' 件）');
         if (f.failed.length) reportError('自動昇天: 買えなかったものがあります: ' + f.failed.join('、'));
         if (slotCountOwned(G) > 0 && !(G.permanentUpgrades && G.permanentUpgrades[0])) {
