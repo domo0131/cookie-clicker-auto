@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.15
+// @version      2.3.16
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.15'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.16'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1764,8 +1764,8 @@ function fmt(n) {
       });
     }
     document.getElementById('ccauto-wake').addEventListener('click', function () {
-      var on = gmGet('ccauto_wake', '') === '1';
-      gmSet('ccauto_wake', on ? '' : '1');
+      var on = gmGet('ccauto_wake', '') !== '0'; // v2.3.16〜 既定はON。'0'と明示したときだけOFF
+      gmSet('ccauto_wake', on ? '0' : '1');
       if (!on) acquireWakeLock(); else releaseWakeLock();
       renderPanel();
     });
@@ -1924,7 +1924,7 @@ function fmt(n) {
     }
     var wkEl = document.getElementById('ccauto-wake');
     if (wkEl) {
-      var wkOn = gmGet('ccauto_wake', '') === '1';
+      var wkOn = gmGet('ccauto_wake', '') !== '0';
       wkEl.textContent = !wkOn ? '💡 画面維持' : (wakeLockObj ? '💡 画面維持:ON' : '💡 画面維持:試行中');
     }
     lg.innerHTML = state.logs.slice(0, 12).map(function (s) {
@@ -2329,7 +2329,11 @@ function fmt(n) {
     setInterval(ascendStep, 2000);
     setInterval(goldenStep, 1500);
     setInterval(renderPanel, 5000);
-    setInterval(function () { gmSet('ccauto_lastBeat', Date.now()); }, 30000);
+    setInterval(function () {
+      gmSet('ccauto_lastBeat', Date.now());
+      // 画面維持ロックがシステム側で外れていたら取り直す（可視状態のときだけ）
+      if (gmGet('ccauto_wake', '') !== '0' && !wakeLockObj && !document.hidden) acquireWakeLock();
+    }, 30000);
     gmSet('ccauto_lastBeat', Date.now());
     state.lastReport = gmGet('ccauto_lastReport', '');
     setTimeout(reportStep, 15000);
@@ -2340,9 +2344,9 @@ function fmt(n) {
     scheduleClicks();
     setInterval(clickWatchdog, 5000);
     if (state.running && clickRate() > 0) log('クリック設定を適用しました（' + clickRate() + '/秒）');
-    if (gmGet('ccauto_wake', '') === '1') acquireWakeLock();
+    if (gmGet('ccauto_wake', '') !== '0') acquireWakeLock();
     document.addEventListener('visibilitychange', function () {
-      if (!document.hidden && gmGet('ccauto_wake', '') === '1' && !wakeLockObj) acquireWakeLock();
+      if (!document.hidden && gmGet('ccauto_wake', '') !== '0' && !wakeLockObj) acquireWakeLock();
     });
     if (CONFIG.autoBackupHours > 0) {
       setInterval(function () {
