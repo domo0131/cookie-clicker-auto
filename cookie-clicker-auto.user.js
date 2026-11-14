@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.21
+// @version      2.3.22
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -24,6 +24,7 @@
     mode: 'readonly',        // 'readonly' = 読み取り専用（買わずに「次に買うもの」だけ表示） / 'auto' = 自動購入する
     buyIntervalMs: 1000,     // 購入判断の間隔（ミリ秒）（v2.3.21: 2000→1000。購入判定と全評価を分離し、評価は evalIntervalMs 間隔で再利用する）
     evalIntervalMs: 2000,    // 全候補の再評価シミュレーションを行う最小間隔（ミリ秒）。この間は前回評価を使い回す（v2.3.21）
+    buyRestMs: 100,          // 購入サイクルの合間の休止（ミリ秒）（v2.3.22: イベント駆動チェーン。クリック処理に枠を譲る）
     maxBatch: 1,             // 1回の判断で買う上限数（安全優先: 1件買って実測検証してから次へ）
     clickPerSecond: 2,       // 大クッキーの自動クリック回数/秒（0で無効）
     clickGolden: true,       // 黄金クッキーを自動でクリックするか（ホロボア配置中は設定に関係なく常に停止）
@@ -37,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.21'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.22'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1148,28 +1149,46 @@ function fmt(n) {
     state.targetPrice = top.price;
   }
 
-  // 評価の再利用（v2.3.21、ChatGPT相談）: 全候補の再計算シミュレーションは重いため、
-  // 「残高だけが増えた」だけの間は前回の評価を使い回し、購入可否と貯金判定だけを新しい残高でやり直す。
-  // 購入・バフ変化・実績変化・建物総数/強化所持数の変化があったら評価を捨て直す。
+  // 評価の再利用とイベント駆動購入（v2.3.22、ChatGPT相談「購入プラン拡張・高速化」）:
+  // 全候補の再計算シミュレーションは最も重い処理のため、全面評価は前回から evalIntervalMs 以上空ける。
+  // その間は前回の評価を使い回し、購入と検証は間隔を空けずに回す（buyStep の戻り値が次の実行までの待ちを決める）。
+  // キャッシュが無効になる条件: バフ変化・実績変化・新品目の解禁（店頭の品揃え変化）・アップグレード購入（相乗効果が変わる）。
+  // 建物の購入では捨てない（買った建物の価格だけ、その場で実価格に直して使い続ける）。古すぎる評価（30秒超）も捨て直す。
   var evalCache = null;
+  var lastEvalAt = 0;
+  var evalWaitMs = 0;
   function evalSignature() {
     var G = W.Game;
-    var bTotal = 0, uTotal = 0;
-    try { for (var k in G.Objects) { bTotal += G.Objects[k].amount || 0; } } catch (e) { /* ignore */ }
-    try { uTotal = G.UpgradesOwned || 0; } catch (e) { /* ignore */ }
-    return buffSignature() + '|' + achievementsWon() + '|' + bTotal + '|' + uTotal;
+    var storeN = -1;
+    try { storeN = G.UpgradesInStore ? G.UpgradesInStore.length : -1; } catch (e) { /* ignore */ }
+    return buffSignature() + '|' + achievementsWon() + '|' + storeN;
   }
   function getEvaluation() {
     var now = Date.now();
-    if (evalCache && (now - evalCache.at) < CONFIG.evalIntervalMs && evalCache.sig === evalSignature()) {
+    if (evalCache && (now - evalCache.at) < 30000 && evalCache.sig === evalSignature()) {
+      evalWaitMs = 0;
       return evalCache.ev;
     }
+    if (lastEvalAt && (now - lastEvalAt) < CONFIG.evalIntervalMs) {
+      evalWaitMs = CONFIG.evalIntervalMs - (now - lastEvalAt);
+      return null; // 全面評価の間隔がまだ空いていない。今回は買わずに待つ
+    }
+    lastEvalAt = now;
     var ev = evaluateCandidates();
     evalCache = { at: now, ev: ev, sig: evalSignature() };
+    evalWaitMs = 0;
     return ev;
   }
 
+  // イベント駆動チェーン（v2.3.22）: buyStep は「次の実行までの待ち時間（ミリ秒）」を返す。
+  // 購入できるときは検証が閉じ次第すぐ次へ進み、貯金中は買える見込みまでの時間を眠る。
+  var buyDelayHint = 1000;
   function buyStep() {
+    buyDelayHint = 1000;
+    try { buyStepInner(); } catch (e) { /* チェーンを止めない */ }
+    return buyDelayHint;
+  }
+  function buyStepInner() {
     if (!state.running || state.mode !== 'auto') return;
     if (!gameReady() || isChallengePage()) return;
     if (ascendBusy()) return; // 自動昇天の実行中は通常の購入を止める
@@ -1181,7 +1200,7 @@ function fmt(n) {
       var recalcOn = false;
       try { recalcOn = (typeof W.Game.recalculateGains === 'number') && W.Game.recalculateGains !== 0; } catch (e) { recalcOn = false; }
       if (recalcOn) {
-        if (Date.now() - state.pendingVerify.at < 4000) { renderPanel(); return; }
+        if (Date.now() - state.pendingVerify.at < 4000) { buyDelayHint = 75; renderPanel(); return; }
         log('検証メモ: ' + state.pendingVerify.label + ' は再計算が終わらないため判定しませんでした');
         state.pendingVerify = null;
         gmSet('ccauto_pendingVerify', '');
@@ -1281,6 +1300,7 @@ function fmt(n) {
     // 1回の判断で、回収効率を毎回判定し直しながら最大 maxBatch 個までまとめ買いする
     for (var step = 0; step < CONFIG.maxBatch; step++) {
       var ev = getEvaluation();
+      if (!ev) { buyDelayHint = Math.max(60, evalWaitMs || 200); break; } // 全面評価の間隔待ち。空転せず眠る
       if (state.halted) break; // 評価中に異常停止が立ったら、その回の候補では買わない
       if (!ev.list.length) break;
       var bank = G.cookies;
@@ -1315,6 +1335,8 @@ function fmt(n) {
           // 貯金中でも「実際に次に買う可能性があるもの」を状態に残す（買える候補が無いときは null = 本当に貯金だけ）
           state.actualNext = watchB ? { label: watchB.label, price: Math.round(watchB.price), kind: watchB.kind, mode: 'candidate' } : null;
           if (boughtTotal === 0) { setSaveTarget(top, ev.cpsNow, true); state.goalTarget = ''; state.goalDetail = ''; setGoals(top, null, 1, true, bank, totalIncome(ev.cpsNow)); }
+          // 貯金中は「買える見込みまで」の時間を眠る（上限2秒。下限150ミリ秒）。収入が上振れしても2秒以内に追従できる
+          buyDelayHint = (R > 0 && top.price > bank) ? Math.max(150, Math.min(2000, Math.round((top.price - bank) / R * 1000))) : 1000;
           break;
         }
       }
@@ -1365,7 +1387,17 @@ function fmt(n) {
       }
       var boughtN = doBuy(buyCand, true);
       if (!boughtN) break;
-      evalCache = null; // 購入が入ったら評価は捨て直す（次回は必ず再評価）
+      if (buyCand.kind === 'upgrade') {
+        evalCache = null; // アップグレード購入は相乗効果や解禁が変わるため評価を捨て直す
+      } else if (evalCache && buyCand.ref) {
+        // 建物購入では評価を使い回し、買った建物の価格だけ実価格に直す（v2.3.22）
+        try {
+          for (var ei = 0; ei < evalCache.ev.list.length; ei++) {
+            var ent = evalCache.ev.list[ei];
+            if (ent.kind === 'building' && ent.ref === buyCand.ref) ent.price = buildingPrice(buyCand.ref);
+          }
+        } catch (e) { /* ignore */ }
+      }
       // 第1目標とは違うものを買ったら「目標までの間に買ったもの」として残す（目標そのものを買ったら消す）
       if (pick.label !== top.label) {
         state.lastInterim = { label: (pick.kind === 'set' ? buyCand.label : pick.label), price: Math.round(buyCand.price), at: Date.now(), goal: top.label };
@@ -1387,6 +1419,7 @@ function fmt(n) {
       log('購入: ' + parts.join(' / '));
       reportStep();
     }
+    if (boughtTotal > 0) buyDelayHint = CONFIG.buyRestMs; // 買えた直後は短い休止だけ入れて次へ（検証は次サイクル冒頭で閉じる）
     renderPanel();
   }
 
@@ -2206,6 +2239,69 @@ function fmt(n) {
     for (var k in G.Upgrades) { if (('' + k).toLowerCase() === low) return G.Upgrades[k]; }
     return null;
   }
+  // 動的プラン（v2.3.22、ChatGPT相談）: 固定リストで買うものが無くなっても、昇天のたびに
+  // プレスティージショップの未所持品を洗い出して買い続ける（プランを更新し続ける仕組み）。
+  // 自動購入から外す品目: Sugar craving（砂糖玉を消費する仕組みに触れるため）
+  var ASCEND_HEAVEN_EXCLUDE = ['Sugar craving'];
+  // 最後に回す品目: Shimmering veil（クリックで割れるため、買う場合も一番最後）
+  var ASCEND_HEAVEN_LAST = ['Shimmering veil'];
+  var ASCEND_SLOT_ORDER = ['Permanent upgrade slot II', 'Permanent upgrade slot III', 'Permanent upgrade slot IV', 'Permanent upgrade slot V'];
+  var ASCEND_ALL_SLOTS = ['Permanent upgrade slot I'].concat(ASCEND_SLOT_ORDER);
+  function slotCountOwned(G) {
+    var n = 0;
+    for (var i = 0; i < ASCEND_ALL_SLOTS.length; i++) { var u = findUpgrade(G, ASCEND_ALL_SLOTS[i]); if (u && u.bought) n++; }
+    return n;
+  }
+  // 優先順に並べた購入候補の一覧: コア13品目 → 条件を満たしたLucky系 → 永続枠II〜V → その他の未所持（安い順）
+  function heavenlyCandidates(G, f) {
+    var skip = (f && f.planSkip) || [];
+    var out = [];
+    var seen = {};
+    function add(name, up, cost, tier) {
+      if (!name || seen[name]) return;
+      if (skip.indexOf(name) >= 0) return;
+      seen[name] = 1;
+      out.push({ name: name, up: up, cost: cost, tier: tier });
+    }
+    var i, up, nm;
+    for (i = 0; i < ASCEND_PLAN.length; i++) {
+      nm = ASCEND_PLAN[i][0]; up = findUpgrade(G, nm);
+      if (up && !up.bought) add(nm, up, (typeof up.basePrice === 'number' ? up.basePrice : ASCEND_PLAN[i][1]), 1);
+    }
+    var sevenCount = (('' + Math.floor(G.prestige || 0)).match(/7/g) || []).length;
+    for (i = 0; i < ASCEND_EXTRA_PLAN.length; i++) {
+      nm = ASCEND_EXTRA_PLAN[i][0]; up = findUpgrade(G, nm);
+      if (up && !up.bought && sevenCount >= ASCEND_EXTRA_PLAN[i][2]) add(nm, up, (typeof up.basePrice === 'number' ? up.basePrice : ASCEND_EXTRA_PLAN[i][1]), 2);
+    }
+    for (i = 0; i < ASCEND_SLOT_ORDER.length; i++) {
+      nm = ASCEND_SLOT_ORDER[i]; up = findUpgrade(G, nm);
+      if (up && !up.bought) add(nm, up, (typeof up.basePrice === 'number' ? up.basePrice : Infinity), 3);
+    }
+    var rest = [];
+    try {
+      for (var k in G.Upgrades) {
+        var u2 = G.Upgrades[k];
+        if (!u2 || u2.bought || u2.pool !== 'prestige') continue;
+        if (seen[k] || skip.indexOf(k) >= 0) continue;
+        if (ASCEND_HEAVEN_EXCLUDE.indexOf(k) >= 0) continue;
+        rest.push({ name: k, up: u2, cost: (typeof u2.basePrice === 'number' ? u2.basePrice : Infinity), tier: 4 });
+      }
+    } catch (e) { /* ignore */ }
+    rest.sort(function (a, b) { return a.cost - b.cost; });
+    var lastOnes = [];
+    for (i = 0; i < rest.length; i++) {
+      if (ASCEND_HEAVEN_LAST.indexOf(rest[i].name) >= 0) lastOnes.push(rest[i]);
+      else out.push(rest[i]);
+    }
+    for (i = 0; i < lastOnes.length; i++) out.push(lastOnes[i]);
+    return out;
+  }
+  function skipFlowItem(f, name, reason) {
+    f.skipped.push(name + '（' + reason + '）');
+    f.planSkip = f.planSkip || [];
+    if (f.planSkip.indexOf(name) < 0) f.planSkip.push(name);
+    ascendSaveFlow(f);
+  }
   // 周回ごとの発動チップ数（その周回で新規に獲得するチップ数）。4周目以降は計画の未購入分の合計
   var ASCEND_TARGETS = { 1: 940, 2: 2185, 3: 12301 };
 
@@ -2317,7 +2413,7 @@ function fmt(n) {
     gmSet('ccauto_pendingSave', sc);
     var f = {
       phase: 'backup', run: (G.resets || 0) + 1, startedAt: Date.now(),
-      bought: [], failed: [], failedNames: [], skipped: [], idx: 0,
+      bought: [], failed: [], failedNames: [], skipped: [], idx: 0, planSkip: [],
       pendingCheck: '', retries: 0, slotKitten: '', chipsAtStart: chips
     };
     ascendSaveFlow(f);
@@ -2335,6 +2431,23 @@ function fmt(n) {
       }
     } catch (e) { /* ignore */ }
     return best;
+  }
+  // 永久スロットの割り当て候補: 所持している通常アップグレードから、子猫系を価格の高い順に優先し、残りも価格順（ChatGPT相談）
+  function slotCandidates(G, n) {
+    var arr = [];
+    try {
+      for (var name in G.Upgrades) {
+        var up = G.Upgrades[name];
+        if (!up || !up.bought || up.pool === 'prestige') continue;
+        arr.push(up);
+      }
+    } catch (e) { /* ignore */ }
+    arr.sort(function (a, b) {
+      var ak = /^Kitten /.test(a.name) ? 0 : 1, bk = /^Kitten /.test(b.name) ? 0 : 1;
+      if (ak !== bk) return ak - bk;
+      return (b.basePrice || 0) - (a.basePrice || 0);
+    });
+    return arr.slice(0, Math.max(0, n));
   }
   function ascendStep() {
     if (!gameReady() || isChallengePage()) return;
@@ -2409,76 +2522,98 @@ function fmt(n) {
           return;
         } else {
           f.failed.push(f.pendingCheck); f.failedNames.push(f.pendingCheck);
+          f.planSkip = f.planSkip || [];
+          if (f.planSkip.indexOf(f.pendingCheck) < 0) f.planSkip.push(f.pendingCheck);
           f.pendingCheck = ''; f.retries = 0;
         }
         ascendSaveFlow(f);
         return;
       }
-      if (f.idx >= ASCEND_PLAN.length) {
-        // 本プランが終わったら、ラッキー系の追加購入を試す（条件がそろったときだけ買う）
-        if (!f.inExtras) { f.inExtras = 1; f.xidx = 0; ascendSaveFlow(f); return; }
-        if ((f.xidx || 0) < ASCEND_EXTRA_PLAN.length) {
-          var xitem = ASCEND_EXTRA_PLAN[f.xidx]; f.xidx++;
-          var xname = xitem[0];
-          var xup = findUpgrade(G, xname);
-          if (!xup) { ascendSaveFlow(f); return; } // 追加分は未発見でも失敗にしない
-          if (xup.bought) { f.bought.push(xname); ascendSaveFlow(f); return; }
-          // 出現条件: 昇天後の名声レベルの数字に「7」が一定個数含まれること（ゲーム側の仕様）
-          var sevenCount = (('' + Math.floor(G.prestige || 0)).match(/7/g) || []).length;
-          if (sevenCount < xitem[2]) { f.skipped.push(xname + '（出現条件未達）'); ascendSaveFlow(f); return; }
-          if (typeof xup.canBuy === 'function' && !xup.canBuy()) { f.skipped.push(xname + '（未解放）'); ascendSaveFlow(f); return; }
-          var xcost = (typeof xup.basePrice === 'number') ? xup.basePrice : xitem[1];
-          if ((G.heavenlyChips || 0) < xcost) { f.skipped.push(xname + '（チップ不足）'); ascendSaveFlow(f); return; }
-          try { xup.buy(); } catch (e) { f.skipped.push(xname + '（購入失敗）'); ascendSaveFlow(f); return; }
-          f.pendingCheck = xname; f.retries = 0; ascendSaveFlow(f);
-          return;
-        }
-        var slotUp = findUpgrade(G, 'Permanent upgrade slot I');
-        f.phase = (slotUp && slotUp.bought) ? 'slot' : 'reincarnate';
+      // 動的プラン（v2.3.22）: 毎tick候補を作り直し（親を買うと子が解禁されるため）、買える最優先の1件を買う
+      var cands = heavenlyCandidates(G, f);
+      if (!f.buyAnnounced) {
+        f.buyAnnounced = 1;
+        var totC = 0;
+        for (var ai = 0; ai < cands.length; ai++) totC += (isFinite(cands[ai].cost) ? cands[ai].cost : 0);
+        log('自動昇天: 購入プラン（未所持 ' + cands.length + ' 品目、合計 ' + fmt(totC) + ' チップ、所持 ' + fmt(G.heavenlyChips || 0) + '）');
+        ascendSaveFlow(f);
+      }
+      var pick = null;
+      for (var ci2 = 0; ci2 < cands.length; ci2++) { if ((G.heavenlyChips || 0) >= cands[ci2].cost) { pick = cands[ci2]; break; } }
+      if (!pick) {
+        // 買えるものが無くなったら次の段階へ（永続枠を持っていれば設定、なければ転生）
+        f.phase = slotCountOwned(G) > 0 ? 'slot' : 'reincarnate';
         ascendSaveFlow(f);
         return;
       }
-      var item = ASCEND_PLAN[f.idx]; f.idx++;
-      var name = item[0];
-      var up = findUpgrade(G, name);
-      if (!up) { f.failed.push(name + '（未発見）'); f.failedNames.push(name); ascendSaveFlow(f); return; }
-      if (up.bought) { f.bought.push(name); ascendSaveFlow(f); return; }
-      if (up.pool !== 'prestige') { f.failed.push(name + '（対象外）'); f.failedNames.push(name); ascendSaveFlow(f); return; }
+      var up2 = pick.up, name2 = pick.name;
+      if (!up2) { skipFlowItem(f, name2, '未発見'); return; }
+      if (up2.pool !== 'prestige') { skipFlowItem(f, name2, '対象外'); return; }
       var parentFailed = false;
       try {
-        if (up.parents && up.parents.length) {
-          for (var pi = 0; pi < up.parents.length; pi++) {
-            var pn = up.parents[pi] && up.parents[pi].name;
-            if (pn && f.failedNames.indexOf(pn) >= 0) parentFailed = true;
+        if (up2.parents && up2.parents.length) {
+          for (var pi2 = 0; pi2 < up2.parents.length; pi2++) {
+            var pn2 = up2.parents[pi2] && up2.parents[pi2].name;
+            if (pn2 && f.failedNames.indexOf(pn2) >= 0) parentFailed = true;
           }
         }
       } catch (e) { /* ignore */ }
-      if (parentFailed) { f.skipped.push(name + '（前提の購入失敗）'); ascendSaveFlow(f); return; }
-      if (typeof up.canBuy === 'function' && !up.canBuy()) { f.skipped.push(name + '（未解放）'); ascendSaveFlow(f); return; }
-      var cost = (typeof up.basePrice === 'number') ? up.basePrice : item[1];
-      if ((G.heavenlyChips || 0) < cost) { f.skipped.push(name + '（チップ不足）'); ascendSaveFlow(f); return; }
-      try { up.buy(); } catch (e) {
-        f.failed.push(name); f.failedNames.push(name); ascendSaveFlow(f); return;
+      if (parentFailed) { skipFlowItem(f, name2, '前提の購入失敗'); return; }
+      if (typeof up2.canBuy === 'function' && !up2.canBuy()) {
+        // 前提品が未購入で買えない場合は、買える前提品を先に買う（候補にあれば差し替え）
+        var parentPick = null;
+        try {
+          if (up2.parents) {
+            for (var pj = 0; pj < up2.parents.length; pj++) {
+              var pu = up2.parents[pj];
+              if (pu && !pu.bought) {
+                for (var ck = 0; ck < cands.length; ck++) {
+                  if (cands[ck].up === pu && (G.heavenlyChips || 0) >= cands[ck].cost) parentPick = cands[ck];
+                }
+              }
+            }
+          }
+        } catch (e) { /* ignore */ }
+        if (parentPick) { up2 = parentPick.up; name2 = parentPick.name; }
+        else { skipFlowItem(f, name2, '未解放'); return; }
       }
-      f.pendingCheck = name; f.retries = 0; ascendSaveFlow(f);
+      var cost2 = (typeof up2.basePrice === 'number') ? up2.basePrice : pick.cost;
+      if ((G.heavenlyChips || 0) < cost2) { skipFlowItem(f, name2, 'チップ不足'); return; }
+      try { up2.buy(); } catch (e) {
+        f.failed.push(name2); f.failedNames.push(name2);
+        f.planSkip = f.planSkip || [];
+        if (f.planSkip.indexOf(name2) < 0) f.planSkip.push(name2);
+        ascendSaveFlow(f);
+        return;
+      }
+      f.pendingCheck = name2; f.retries = 0; ascendSaveFlow(f);
       return;
     }
     if (f.phase === 'slot') {
-      var kitten = bestKitten(G);
-      if (!kitten) {
-        log('自動昇天: 設定できる子猫アップグレードが無いため、永久スロットは空のまま進みます');
+      // 全ての永続枠に割り当てる（v2.3.22で枠II以降にも対応。候補は子猫系を価格順に優先）
+      var slotN = slotCountOwned(G);
+      var candsS = slotCandidates(G, slotN);
+      if (!candsS.length) {
+        log('自動昇天: 設定できるアップグレードが無いため、永久スロットは空のまま進みます');
         f.phase = 'reincarnate'; ascendSaveFlow(f);
         return;
       }
-      if (G.permanentUpgrades && G.permanentUpgrades[0] === kitten.id) {
-        f.slotKitten = kitten.name; f.phase = 'reincarnate'; ascendSaveFlow(f);
-        log('自動昇天: 永久スロットに ' + kitten.name + ' を設定しました');
+      var allSet = true;
+      for (var si = 0; si < candsS.length; si++) {
+        if (!G.permanentUpgrades || G.permanentUpgrades[si] !== candsS[si].id) allSet = false;
+      }
+      if (allSet) {
+        f.slotKitten = candsS.map(function (u) { return u.name; }).join('、');
+        f.phase = 'reincarnate'; ascendSaveFlow(f);
+        log('自動昇天: 永久スロットに ' + f.slotKitten + ' を設定しました');
         return;
       }
       if (!f.slotTried) {
         f.slotTried = 1;
         // 選択画面を開く方式は画面が開いたまま残ってしまうため、内部状態へ直接設定して次tickで検証する
-        try { if (G.permanentUpgrades) G.permanentUpgrades[0] = kitten.id; } catch (e) { /* ignore */ }
+        try {
+          if (G.permanentUpgrades) { for (var sj = 0; sj < candsS.length; sj++) G.permanentUpgrades[sj] = candsS[sj].id; }
+        } catch (e) { /* ignore */ }
         ascendSaveFlow(f);
         return;
       }
@@ -2498,8 +2633,7 @@ function fmt(n) {
         try { gmSet('ccauto_ascendLast', { at: f.completedAt, run: f.run, chips: f.chipsAtStart, bought: f.bought, failed: f.failed, skipped: f.skipped, slot: f.slotKitten }); } catch (e) { /* ignore */ }
         log('自動昇天が完了しました（' + f.run + '周目終了、チップ ' + f.chipsAtStart + ' 個、購入 ' + f.bought.length + ' 件、見送り ' + f.skipped.length + ' 件）');
         if (f.failed.length) reportError('自動昇天: 買えなかったものがあります: ' + f.failed.join('、'));
-        var slotUpDone = findUpgrade(G, 'Permanent upgrade slot I');
-        if (slotUpDone && slotUpDone.bought && !(G.permanentUpgrades && G.permanentUpgrades[0])) {
+        if (slotCountOwned(G) > 0 && !(G.permanentUpgrades && G.permanentUpgrades[0])) {
           reportError('自動昇天: 永久スロットが空のまま終わりました');
         }
         try { reportStep(); } catch (e) { /* ignore */ }
@@ -2543,7 +2677,12 @@ function fmt(n) {
 
     sampleClicks();
     setInterval(sampleClicks, 1000);
-    setInterval(buyStep, CONFIG.buyIntervalMs);
+    // 購入はイベント駆動チェーンで回す（v2.3.22）: buyStep の戻り値が次の実行までの待ち時間
+    setTimeout(function buyChain() {
+      var d = 1000;
+      try { d = buyStep(); } catch (e) { d = 1000; }
+      setTimeout(buyChain, Math.max(30, Math.min(5000, d || 1000)));
+    }, 1500);
     setInterval(ascendStep, 2000);
     setInterval(goldenStep, 1500);
     setInterval(renderPanel, 5000);
