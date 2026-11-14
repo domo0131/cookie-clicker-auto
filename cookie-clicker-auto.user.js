@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.34
+// @version      2.3.36
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.34'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.36'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -108,7 +108,7 @@
     return fallback;
   })();
   var TAB_STALE_MS = 75000; // 主張がこの時間更新されなければ途絶えたとみなす（背面タブのタイマー抑制が約60秒あるため余裕を持たせる）
-  var tabState = { primary: false, decided: false, guardInstalled: false, autosaveOffByUs: false, wasFollower: false };
+  var tabState = { primary: false, decided: false, guardInstalled: false, autosaveOffByUs: false, wasFollower: false, justHandedOver: false, primarySince: 0 };
   // ページ読み込みごとの個体識別子。タブ複製で sessionStorage ごとコピーされ TAB_ID が
   // 重なっても、nonce の違いで別個体と区別できる（v2.3.30、ChatGPTレビューに基づく）
   var TAB_NONCE = 'n' + Date.now().toString(36) + Math.floor(Math.random() * 1e9).toString(36);
@@ -131,6 +131,8 @@
   }
   function tabSetRole(primary) {
     var changed = (tabState.primary !== primary) || !tabState.decided;
+    // 主タブになった時刻（巻き戻し検知の保留窓の起点。v2.3.35）
+    if (primary && changed) tabState.primarySince = Date.now();
     tabState.primary = primary;
     tabState.decided = true;
     // 初回から従タブの場合も含め、従になった履歴は必ず残す（v2.3.32、ChatGPTレビュー）。
@@ -180,7 +182,7 @@
     if (hv && hv.id === TAB_ID && (now - (hv.at || 0)) < 120000) {
       var otherClaims = !!(c && c.id !== TAB_ID && (now - c.at) < TAB_STALE_MS);
       handoverTake(); // 記録はどちらに転んでも消費する
-      if (!otherClaims) { tabClaimWrite(); tabSetRole(true); return; }
+      if (!otherClaims) { tabState.justHandedOver = true; tabClaimWrite(); tabSetRole(true); return; }
       c = tabClaimRead();
     }
     // 自分と同じ ID で別個体（nonce違い）の新しい主張がある = タブ複製か自分の再読み込み。
@@ -201,8 +203,13 @@
     setTimeout(function () {
       var c2 = tabClaimRead();
       if (!(c2 && c2.id === TAB_ID && (!c2.nonce || c2.nonce === TAB_NONCE))) { tabSetRole(false); return; }
+      // 引き継ぎ再読み込みの直後なら、その事実をタブ内変数で保持する（v2.3.35、ChatGPTレビュー:
+      // 判定材料は消費する場所で確定し、処理は主タブ確定後に行う。共有の handoverReloadAt は
+      // 別タブの操作でも残るため、時刻の近さだけでは判定しない）
+      var tookHandover = handoverTake();
+      if (tookHandover) tabState.justHandedOver = true;
       // 引き継ぎ（従タブだった）場合は、稼働開始の前に最新セーブを読み直す
-      if (tabState.wasFollower && !handoverTake()) { handoverReload(); return; }
+      if (tabState.wasFollower && !tookHandover) { handoverReload(); return; }
       tabSetRole(true);
     }, 1500);
   }
@@ -352,7 +359,7 @@
     state.logs.unshift(state.lastAction);
     if (state.logs.length > CONFIG.logMax) state.logs.length = CONFIG.logMax;
     saveState();
-    renderPanel();
+    requestRender(); // v2.3.36: ログのたびの即時描画はまとめ描画へ（カクつき対策、ChatGPTレビュー）
   }
 
   function fmtDur(sec) {
@@ -1388,6 +1395,21 @@ function fmt(n) {
   var evalCache = null;
   var lastEvalAt = 0;
   var evalWaitMs = 0;
+  // 負荷の計測（v2.3.36、ChatGPTレビューに基づく）: 1分ごとの集計だけを payload に載せ、
+  // 「どの経路に何msの最大値が出たか」でカクつきの原因を切り分ける。collectStatus で読み取り＆リセット。
+  var perf = { evalCount: 0, evalMs: 0, evalMaxMs: 0, clickMs: 0, clickTicks: 0, longFrames: 0, maxFrameMs: 0 };
+  var frameLastT = 0;
+  function frameWatch(t) {
+    if (frameLastT) {
+      var d = t - frameLastT;
+      if (d < 1000) { // 1000ms超はタブ非表示などによる停止として数えない
+        if (d > 100) perf.longFrames++;
+        if (d > perf.maxFrameMs) perf.maxFrameMs = Math.round(d);
+      }
+    }
+    frameLastT = t;
+    try { requestAnimationFrame(frameWatch); } catch (e) { /* ignore */ }
+  }
   function evalSignature() {
     var G = W.Game;
     var storeN = -1;
@@ -1405,7 +1427,10 @@ function fmt(n) {
       return null; // 全面評価の間隔がまだ空いていない。今回は買わずに待つ
     }
     lastEvalAt = now;
+    var evT0 = performance.now();
     var ev = evaluateCandidates();
+    var evMs = performance.now() - evT0;
+    perf.evalCount++; perf.evalMs += evMs; if (evMs > perf.evalMaxMs) perf.evalMaxMs = evMs;
     evalCache = { at: now, ev: ev, sig: evalSignature() };
     evalWaitMs = 0;
     return ev;
@@ -1432,7 +1457,7 @@ function fmt(n) {
       var recalcOn = false;
       try { recalcOn = !!W.Game.recalculateGains; } catch (e) { recalcOn = false; } // v2.3.29: 真偽値で立つ経路も拾う
       if (recalcOn) {
-        if (Date.now() - state.pendingVerify.at < 4000) { buyDelayHint = 75; renderPanel(); return; }
+        if (Date.now() - state.pendingVerify.at < 4000) { buyDelayHint = 75; requestRender(); return; }
         log('検証メモ: ' + state.pendingVerify.label + ' は再計算が終わらないため判定しませんでした');
         state.pendingVerify = null;
         gmSet('ccauto_pendingVerify', '');
@@ -1654,10 +1679,12 @@ function fmt(n) {
         parts.push(k + (boughtCounts[k].n > 1 ? ' ×' + boughtCounts[k].n : '') + '（' + fmt(boughtCounts[k].spent) + '）');
       }
       log('購入: ' + parts.join(' / '));
-      reportStep();
+      // v2.3.36: 購入ごとの即時送信はやめ、60秒周期の送信に載せる（ChatGPTレビュー）。
+      // 購入直後は候補キャッシュが空で、送信の組み立てが全面評価を直呼びして
+      // ロングタスク化するのがカクつきの主容疑だったため。昇天バックアップ等の送信は別経路で維持。
     }
     if (boughtTotal > 0) buyDelayHint = CONFIG.buyRestMs; // 買えた直後は短い休止だけ入れて次へ（検証は次サイクル冒頭で閉じる）
-    renderPanel();
+    requestRender();
   }
 
   /* ---------------- クリック ---------------- */
@@ -1667,6 +1694,22 @@ function fmt(n) {
     if (isNaN(v)) v = CONFIG.clickPerSecond;
     if (v < 0) v = 0;
     if (v > 250) v = 250; // ゲーム側のクリック計数上限が約250/秒のため
+    return v;
+  }
+  // クリックの時間予算（v2.3.36）: GMキーで切り替えて比較できるようにした（既定は従来どおり15ms）
+  function clickBudgetMs() {
+    var v = parseFloat(gmGet('ccauto_clickBudgetMs', ''));
+    if (isNaN(v)) v = CONFIG.clickBudgetMs;
+    if (v < 2) v = 2;
+    if (v > 50) v = 50;
+    return v;
+  }
+  // 画面クリック（数字ポップアップつき）の毎秒回数（v2.3.36）: GMキーで調整可能、既定は従来どおり4
+  function visualCps() {
+    var v = parseFloat(gmGet('ccauto_visualCps', ''));
+    if (isNaN(v)) v = VISUAL_CLICKS_PER_SEC;
+    if (v < 0) v = 0;
+    if (v > 10) v = 10;
     return v;
   }
 
@@ -1749,14 +1792,18 @@ function fmt(n) {
     var elapsedMs = clickLastAt > 0 ? (now - clickLastAt) : 0;
     if (elapsedMs > 0) {
       clickAcc += r * elapsedMs / 1000;
-      visualAcc = Math.min(8, visualAcc + VISUAL_CLICKS_PER_SEC * elapsedMs / 1000);
+      var vc = visualCps();
+      visualAcc = Math.min(Math.max(2, vc * 2), visualAcc + vc * elapsedMs / 1000);
     }
     clickLastAt = now;
+    if (clickAcc > r) clickAcc = r; // v2.3.36: 蓄積の上限はループに入る前に適用（長い停止後の初回tickで一気に叩かない）
     var n = Math.floor(clickAcc);
     if (n <= 0) return;
     // 1tickあたりの時間予算の中でまとめて叩く。予算を超えたら残りは次tickへ回し、
     // ゲーム本体（生産・描画・保存）の処理を飢えさせない。
-    var t0 = Date.now();
+    // v2.3.36: 予算チェックを4回ごと→毎回に変更し、上限を厳密にした（ChatGPTレビュー）
+    var budget = clickBudgetMs();
+    var t0 = performance.now();
     var done = 0;
     while (done < n) {
       try {
@@ -1765,8 +1812,9 @@ function fmt(n) {
         else { W.Game.ClickCookie(); }
       } catch (e) { break; }
       done++;
-      if ((done & 3) === 0 && Date.now() - t0 >= CONFIG.clickBudgetMs) break;
+      if (performance.now() - t0 >= budget) break;
     }
+    perf.clickMs += performance.now() - t0; perf.clickTicks++;
     clickAcc -= done;
     if (clickAcc > r) clickAcc = r; // 溜め込みは最大で設定値の1秒ぶんまで
     if (clickAcc < 0) clickAcc = 0;
@@ -2103,19 +2151,63 @@ function fmt(n) {
         // セーブの初期化（ワイプ・新規開始）は新しい系列として扱い、巻き戻しとはみなさない
         try { gmSet('ccauto_checkpoint', { resets: 0, prestige: 0, allTime: 0, at: now }); } catch (e) { /* ignore */ }
         try { gmSet('ccauto_rollbackSeen', 0); } catch (e) { /* ignore */ }
-      } else if (resets < cp.resets || (resets === cp.resets && prestigeNow < cp.prestige) ||
-                 (typeof cp.allTime === 'number' && allTimeNow > 0 && allTimeNow < cp.allTime * 0.999)) {
-        if (gmGet('ccauto_rollbackSeen', 0) !== 1) {
-          gmSet('ccauto_rollbackSeen', 1);
-          reportError('セーブの巻き戻しを検知しました（到達済み: 昇天 ' + cp.resets + ' 回／プレステージ ' + cp.prestige + '）。再昇天で追いつくまで記録を保護します（購入は継続します）');
-        }
       } else {
-        if (gmGet('ccauto_rollbackSeen', 0) === 1) {
-          gmSet('ccauto_rollbackSeen', 0);
-          log('巻き戻しから回復しました（記録が到達済みに追いつきました）');
-        }
-        if (resets > cp.resets || prestigeNow > cp.prestige || allTimeNow > (cp.allTime || 0)) {
-          try { gmSet('ccauto_checkpoint', { resets: resets, prestige: prestigeNow, allTime: allTimeNow, at: now }); } catch (e) { /* ignore */ }
+        // v2.3.35（ChatGPTレビュー）: 判定を脚ごとに分ける。resets / prestige の後退は従来どおり
+        // 即時報告（保留は適用しない）。allTime だけの差は、引き継ぎ直後の古いセーブ読み直しでも
+        // 起きる（実例: 更新リロード時、約195秒分の生産量が 0.1% 閾値を超えて誤検知した）ため、
+        // 引き継ぎ直後で resets・prestige が到達済みと一致する場合に限り、主タブ復帰から5分間は
+        // 報告を保留する。checkpoint の高値は保持し、下方への再基準化はしない（同じ resets・
+        // prestige のまま起きる本物の巻き戻しを吸収してしまわないため）。保留中に累計がさらに
+        // 明確に下がった場合と、保留期限を過ぎても差が残る場合は一度だけ報告する。保留の期限は
+        // 主タブ復帰時刻から数え、再起動のたびに延長しない（GM に保持した期限を使い回す）
+        var legResets = resets < cp.resets;
+        var legPrestige = (resets === cp.resets && prestigeNow < cp.prestige);
+        var legAllTime = (typeof cp.allTime === 'number' && isFinite(cp.allTime) && isFinite(allTimeNow) &&
+                          allTimeNow > 0 && allTimeNow < cp.allTime * 0.999);
+        var rbReport = function () {
+          if (gmGet('ccauto_rollbackSeen', 0) !== 1) {
+            gmSet('ccauto_rollbackSeen', 1);
+            reportError('セーブの巻き戻しを検知しました（到達済み: 昇天 ' + cp.resets + ' 回／プレステージ ' + cp.prestige + '）。再昇天で追いつくまで記録を保護します（購入は継続します）');
+          }
+        };
+        if (legResets || legPrestige) {
+          try { gmSet('ccauto_rbGrace', null); } catch (e) { /* ignore */ }
+          rbReport();
+        } else if (legAllTime) {
+          var grace = null;
+          try { grace = gmGet('ccauto_rbGrace', null); } catch (e) { grace = null; }
+          var graceMatches = !!(grace && grace.cpAllTime === cp.allTime && grace.resets === resets && grace.prestige === prestigeNow);
+          if (!graceMatches && tabState.justHandedOver && tabState.primarySince && (now - tabState.primarySince) < 5 * 60 * 1000) {
+            grace = { until: tabState.primarySince + 5 * 60 * 1000, cpAllTime: cp.allTime, firstAllTime: allTimeNow, resets: resets, prestige: prestigeNow };
+            try { gmSet('ccauto_rbGrace', grace); } catch (e) { /* ignore */ }
+            try { log('検証メモ: 引き継ぎ直後のため巻き戻し判定を保留しました（古いセーブの読み直しの可能性。5分間様子を見ます）'); } catch (e) { /* ignore */ }
+            graceMatches = true;
+          }
+          if (!graceMatches) {
+            rbReport();
+          } else if (allTimeNow < grace.firstAllTime * 0.999) {
+            // 保留中にさらに明確に後退した = 本物の巻き戻しの疑いが強いので即時報告する
+            try { gmSet('ccauto_rbGrace', null); } catch (e) { /* ignore */ }
+            rbReport();
+          } else if (now > (grace.until || 0)) {
+            try { gmSet('ccauto_rbGrace', null); } catch (e) { /* ignore */ }
+            rbReport();
+          }
+          // それ以外は保留中: rollbackSeen も checkpoint も触らない
+        } else {
+          try {
+            if (gmGet('ccauto_rbGrace', null)) {
+              gmSet('ccauto_rbGrace', null);
+              log('巻き戻し判定の保留は解消しました（累計が到達済みに追いつきました）');
+            }
+          } catch (e) { /* ignore */ }
+          if (gmGet('ccauto_rollbackSeen', 0) === 1) {
+            gmSet('ccauto_rollbackSeen', 0);
+            log('巻き戻しから回復しました（記録が到達済みに追いつきました）');
+          }
+          if (resets > cp.resets || prestigeNow > cp.prestige || allTimeNow > (cp.allTime || 0)) {
+            try { gmSet('ccauto_checkpoint', { resets: resets, prestige: prestigeNow, allTime: allTimeNow, at: now }); } catch (e) { /* ignore */ }
+          }
         }
       }
     } catch (e) { /* ignore */ }
@@ -2247,7 +2339,8 @@ function fmt(n) {
     try { status.heavenLog = gmGet('ccauto_heavenLog', []); } catch (e) { /* ignore */ }
     try { status.ascendLast = gmGet('ccauto_ascendLast', null); } catch (e) { /* ignore */ }
     try { status.ascendEval = effCache ? effCache.data : null; } catch (e) { /* ignore */ }
-    try { status.rolledBack = gmGet('ccauto_rollbackSeen', 0) === 1; } catch (e) { /* ignore */ }
+    // rolledBack は trackRun() の判定後に読む（v2.3.35、ChatGPTレビュー: 判定前に読むと
+    // 新規エラーと rolledBack が同じ送信内で食い違うため）。下の trackRun 呼び出し後に設定する
     // 永久スロットの中身（v2.3.26: 遠隔確認用。IDをゲーム内定義と照合して名前で載せる）
     try {
       var slotNames = [];
@@ -2347,8 +2440,11 @@ function fmt(n) {
       status.runs = runInfo.runs;
       status.runCurrent = runInfo.current;
     } catch (e) { /* ignore */ }
+    try { status.rolledBack = gmGet('ccauto_rollbackSeen', 0) === 1; } catch (e) { /* ignore */ }
     try {
-      var evD = evaluateCandidates();
+      // v2.3.36: 送信の組み立てでは全面評価を直呼びしない（ChatGPTレビュー）。
+      // 最後に完了した評価（キャッシュ）だけを参照し、無ければ空として送る（目標類は state 側が保持）。
+      var evD = (evalCache && evalCache.ev) ? evalCache.ev : { list: [], cpsNow: baseCps() };
       var topD = evD.list.length ? evD.list[0] : null;
       status.diag = {
         top: topD ? topD.label : '',
@@ -2388,6 +2484,15 @@ function fmt(n) {
         }
       }
       if (pendingSave) { status.saveBackup = pendingSave; lastSentSave = pendingSave; }
+    } catch (e) { /* ignore */ }
+    // 負荷の計測（v2.3.36）: 前回送信からの集計を載せてリセットする
+    try {
+      status.perf = {
+        evalCount: perf.evalCount, evalMs: Math.round(perf.evalMs), evalMaxMs: Math.round(perf.evalMaxMs),
+        clickMs: Math.round(perf.clickMs), longFrames: perf.longFrames, maxFrameMs: perf.maxFrameMs
+      };
+      perf.evalCount = 0; perf.evalMs = 0; perf.evalMaxMs = 0;
+      perf.clickMs = 0; perf.clickTicks = 0; perf.longFrames = 0; perf.maxFrameMs = 0;
     } catch (e) { /* ignore */ }
     return status;
   }
@@ -2664,7 +2769,23 @@ function fmt(n) {
     log('画面スリープ防止を解除しました');
   }
 
+  // 描画の集約（v2.3.36、ChatGPTレビュー）: ログ・購入などの頻繁な経路は requestRender() 経由で
+  // 最大1秒に1回へまとめる。手動ボタン等の応答は従来どおり renderPanel() を直接呼んで即時描画する。
+  var lastRenderAt = 0;
+  var renderTimer = null;
+  function requestRender() {
+    var now = Date.now();
+    var wait = 1000 - (now - lastRenderAt);
+    if (wait <= 0) { try { renderPanel(); } catch (e) { /* ignore */ } return; }
+    if (!renderTimer) {
+      renderTimer = setTimeout(function () {
+        renderTimer = null;
+        try { renderPanel(); } catch (e) { /* ignore */ }
+      }, wait);
+    }
+  }
   function renderPanel() {
+    lastRenderAt = Date.now();
     // パネルの自己修復：消えていたら作り直し、外れていたら付け直す
     if (!panel || !document.getElementById('ccauto-panel')) { panel = null; buildPanel(); }
     if (panel && panel.parentNode !== document.body) document.body.appendChild(panel);
@@ -2692,8 +2813,9 @@ function fmt(n) {
         ' / 👆' + (clickRate() > 0 ? clickRate() + '/秒（実測' + Math.round(measuredClickRate()) + '）' : 'オフ');
       if (!state.nextTarget) {
         try {
-          var ev = evaluateCandidates();
-          if (ev.list.length) {
+          // v2.3.36: パネルからも全面評価を直呼びしない。最後に完了した評価があれば流用するだけにする
+          var ev = (evalCache && evalCache.ev) ? evalCache.ev : null;
+          if (ev && ev.list.length) {
             state.nextTarget = ev.list[0].label;
             state.nextDetail = '価格 ' + fmt(ev.list[0].price);
             state.targetPrice = ev.list[0].price;
@@ -3540,10 +3662,27 @@ function fmt(n) {
     recoveryDone = true;
     // 以前の版で立った購入停止フラグは引き継がない（止まらない運用に変更したため）
     if (state.halted) { state.halted = false; gmSet('ccauto_halted', 0); }
-    // 購入の検証が終わらないうちに再読み込みされた形跡があれば、報告だけして購入は続ける
+    // 購入の検証が終わらないうちに再読み込みされた形跡があれば、検証マーカーを破棄して購入は続ける。
+    // v2.3.35（ChatGPTレビューで B3 採用）: 通常の再読み込み（版の更新・引き継ぎ・自動復旧など）でも
+    // 購入直後なら毎回起きるため、単発はパネルの検証メモに落とすだけにする。直近60分で3回以上
+    // 破棄した場合だけ、リロードの繰り返しとして一度報告する（報告は最低60分間隔）
     if (gmGet('ccauto_pendingVerify', '')) {
       gmSet('ccauto_pendingVerify', '');
-      reportError('購入の検証が未完了のまま再読み込みされました（購入は継続します）');
+      var pvDropNow = Date.now();
+      var pvHist = [];
+      try { pvHist = gmGet('ccauto_pvDropHist', []); } catch (e) { pvHist = []; }
+      if (!Array.isArray(pvHist)) pvHist = [];
+      pvHist.push(pvDropNow);
+      pvHist = pvHist.filter(function (t) { return typeof t === 'number' && (pvDropNow - t) < 60 * 60 * 1000; });
+      try { gmSet('ccauto_pvDropHist', pvHist); } catch (e) { /* ignore */ }
+      var pvLastReport = 0;
+      try { pvLastReport = gmGet('ccauto_pvDropLastReport', 0) || 0; } catch (e) { pvLastReport = 0; }
+      if (pvHist.length >= 3 && (pvDropNow - pvLastReport) >= 60 * 60 * 1000) {
+        try { gmSet('ccauto_pvDropLastReport', pvDropNow); } catch (e) { /* ignore */ }
+        reportError('購入検証の中断が直近60分で' + pvHist.length + '回発生しました（購入は継続します）');
+      } else {
+        log('検証メモ: 購入の検証が未完了のまま再読み込みされました（購入は継続します）');
+      }
     }
     // 自動昇天の途中で再読み込みされた場合は、二重実行を避けて安全側に倒す
     var bootFlow = ascendFlow();
@@ -3607,6 +3746,7 @@ function fmt(n) {
     setInterval(goldenStep, 1500);
     setInterval(spellStep, 2000);
     setInterval(renderPanel, 5000);
+    try { requestAnimationFrame(frameWatch); } catch (e) { /* ignore */ } // v2.3.36: フレーム計測（カクつき切り分け用）
     setInterval(function () {
       if (tabState.primary) gmSet('ccauto_lastBeat', Date.now()); // 稼働時刻は主タブだけが更新する（v2.3.32）
       // 画面維持ロックがシステム側で外れていたら取り直す（可視状態のときだけ）
