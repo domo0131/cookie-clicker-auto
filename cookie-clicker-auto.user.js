@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.26
+// @version      2.3.27
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.26'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.27'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -347,6 +347,19 @@ function fmt(n) {
   function holoboreState() {
     // 'slotted'（配置中）/ 'none'（未配置で確定）/ 'unknown'（判定不能）の3状態。
     // 'none' のときだけ黄金クッキーをクリックしてよい。
+    // v2.3.27: パンテオンを直接読む（Game.hasGod の有無に依存しない）
+    try {
+      var tt = W.Game.Objects['Temple'];
+      var tmg = tt && tt.minigame;
+      if (tmg && tmg.gods) {
+        for (var gid in tmg.gods) {
+          var gg = tmg.gods[gid];
+          if (gg && typeof gg.slot === 'number' && gg.slot !== -1 &&
+              (gid === 'asceticism' || (gg.name || '').indexOf('Holobore') >= 0)) return 'slotted';
+        }
+        return 'none';
+      }
+    } catch (e) { /* fallthrough */ }
     try {
       if (typeof W.Game.hasGod === 'function') {
         var r = W.Game.hasGod('asceticism');
@@ -1671,6 +1684,124 @@ function fmt(n) {
     } catch (e) { /* ignore */ }
   }
 
+  /* ---------------- グリモア（運命の手）とパンテオン（v2.3.27） ----------------
+     塔Lv1でグリモア、寺院Lv1でパンテオンが開く（レベルは昇天しても残る）。
+     運命の手: Frenzy中に画面にクッキーが無く魔力が足りるときだけ撃ち、
+     Click Frenzyとの重なりを狙う。出た憤怒は goldenStep が元々触らない。
+     パンテオン: ダイヤ=Muridal（クリック強化）、ヒスイ=Mokalsium、ルビーは空。
+     配置・付け替えで生産が変わるため、付け替え時は購入評価のキャッシュを捨てる。 */
+  var spellState = { lastCastKey: '', lastAttempt: 0, pantheonAt: 0 };
+
+  function spellStats() {
+    try { return JSON.parse(gmGet('ccauto_spellStats', '') || '{}'); } catch (e) { return {}; }
+  }
+  function spellStatsBump(key) {
+    try {
+      var s = spellStats();
+      s[key] = (s[key] || 0) + 1;
+      gmSet('ccauto_spellStats', JSON.stringify(s));
+    } catch (e) { /* ignore */ }
+  }
+
+  function findGod(mg, match) {
+    try {
+      for (var gid in mg.gods) {
+        var g = mg.gods[gid];
+        if (g && (g.name || '').indexOf(match) >= 0) return g;
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  function pantheonMaintain(G) {
+    var t = G.Objects['Temple'];
+    var mg = t && t.minigame;
+    if (!mg || !mg.gods || typeof mg.slotGod !== 'function') return;
+    var targets = [{ match: 'Muridal', slot: 0, label: 'ダイヤ' }, { match: 'Mokalsium', slot: 2, label: 'ヒスイ' }];
+    var changed = false;
+    for (var i = 0; i < targets.length; i++) {
+      var tg = targets[i];
+      var god = findGod(mg, tg.match);
+      if (!god || god.slot === tg.slot) continue;
+      if (typeof mg.swaps === 'number' && mg.swaps < 1) continue; // 付け替え回数が無い
+      try { mg.slotGod(god, tg.slot); } catch (e) { /* ignore */ }
+      if (god.slot === tg.slot) {
+        changed = true;
+        log('パンテオン配置: ' + tg.match + ' → ' + tg.label);
+      }
+    }
+    if (changed) {
+      try { evalCache = null; upGainCache = {}; bGainCache = {}; } catch (e) { /* ignore */ }
+    }
+    // 配置が揃ったら周回ごとに1回だけ記録する
+    try {
+      var m1 = findGod(mg, 'Muridal'), m2 = findGod(mg, 'Mokalsium');
+      if (m1 && m1.slot === 0 && m2 && m2.slot === 2) {
+        var rk = 'r' + (G.resets || 0);
+        if (gmGet('ccauto_pantheonRun', '') !== rk) {
+          gmSet('ccauto_pantheonRun', rk);
+          log('パンテオン配置完了: ダイヤ=Muridal（クリック強化）, ヒスイ=Mokalsium');
+        }
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function spellStep() {
+    if (!tabState.primary) return;
+    if (!state.running) return;
+    if (!gameReady() || isChallengePage()) return;
+    if (ascendBusy()) return;
+    var G = W.Game;
+    // パンテオンの配置維持（30秒に1回まで）
+    if (Date.now() - spellState.pantheonAt > 30000) {
+      spellState.pantheonAt = Date.now();
+      try { pantheonMaintain(G); } catch (e) { /* ignore */ }
+    }
+    // 運命の手（Force the Hand of Fate）
+    try {
+      var tower = G.Objects['Wizard tower'];
+      var mg = tower && tower.minigame;
+      if (!mg || !mg.spells) return;
+      var spell = mg.spells['hand of fate'];
+      if (!spell) return;
+      var frenzy = (G.buffs || {})['Frenzy'];
+      if (!frenzy) return;
+      var fps = G.fps || 30;
+      var remainSec = (frenzy.time || 0) / fps;
+      if (remainSec < 15) return; // 残り短いFrenzyでは撃たない
+      if ((G.shimmers || []).length > 0) return; // 画面にクッキーがある間は撃たない
+      var key = 'fz' + Math.round((Date.now() + remainSec * 1000) / 1000);
+      if (spellState.lastCastKey === key) return; // 同じFrenzyでは1回だけ
+      if (Date.now() - spellState.lastAttempt < 60000) return;
+      var max = (typeof mg.magicMax === 'number') ? mg.magicMax : 0;
+      var magic = (typeof mg.magic === 'number') ? mg.magic : 0;
+      if (max <= 0) return;
+      var cost = null;
+      if (typeof mg.computeSpellCost === 'function') { try { cost = mg.computeSpellCost(spell); } catch (e) { cost = null; } }
+      if (typeof cost !== 'number' || !(cost > 0)) cost = max; // 計算できない場合は満タンのときだけ
+      if (magic < cost) return;
+      spellState.lastAttempt = Date.now();
+      spellState.lastCastKey = key;
+      var beforeSet = (G.shimmers || []).slice();
+      var magicBefore = magic;
+      try { mg.castSpell(spell); } catch (e) { /* 成否は魔力と出現で判定する */ }
+      spellStatsBump('casts');
+      log('グリモア: 運命の手を詠唱（Frenzy残り約' + Math.round(remainSec) + '秒）');
+      setTimeout(function () {
+        try {
+          var after = W.Game.shimmers || [];
+          var fresh = null;
+          for (var i = 0; i < after.length; i++) { if (beforeSet.indexOf(after[i]) < 0) { fresh = after[i]; break; } }
+          var mg2 = W.Game.Objects['Wizard tower'].minigame;
+          var dropped = mg2 && typeof mg2.magic === 'number' ? (magicBefore - mg2.magic) : 0;
+          if (fresh && fresh.wrath) { spellStatsBump('wrath'); log('運命の手: 憤怒クッキーが出現（触りません）'); }
+          else if (fresh) { spellStatsBump('golden'); log('運命の手: 黄金クッキーが出現'); }
+          else if (dropped < 1) { spellStatsBump('failed'); log('運命の手: 詠唱できなかったようです'); }
+        } catch (e) { /* ignore */ }
+      }, 400);
+    } catch (e) { /* ignore */ }
+  }
+
   /* ---------------- セーブの書き出し ---------------- */
 
   function exportSave(manual) {
@@ -1906,6 +2037,9 @@ function fmt(n) {
     try {
       var gsState = 'unknown';
       if (typeof G.switchGolden === 'number') gsState = G.switchGolden ? 'on' : 'off';
+      else if (typeof G.switchGolden === 'boolean') gsState = G.switchGolden ? 'on' : 'off';
+      else if (findUpgrade(G, 'Golden switch [on]')) gsState = 'on'; // v2.3.27: アイテム名からも判定
+      else if (findUpgrade(G, 'Golden switch [off]')) gsState = 'off';
       status.goldenSwitch = gsState;
       if (gsState === 'on') {
         if (gmGet('ccauto_gsWarned', 0) !== 1) {
@@ -1928,6 +2062,31 @@ function fmt(n) {
         level: (typeof G.dragonLevel === 'number') ? G.dragonLevel : null,
         aura1: auraName(G.dragonAura), aura2: auraName(G.dragonAura2)
       };
+    } catch (e) { /* ignore */ }
+    // グリモアとパンテオンの状態（v2.3.27: 遠隔確認用）
+    try {
+      var tw = G.Objects['Wizard tower'];
+      var gmg = tw && tw.minigame;
+      if (gmg) {
+        var ss = spellStats();
+        status.grimoire = {
+          magic: Math.floor(gmg.magic || 0), magicMax: Math.floor(gmg.magicMax || 0),
+          casts: ss.casts || 0, golden: ss.golden || 0, wrath: ss.wrath || 0, failed: ss.failed || 0
+        };
+      }
+    } catch (e) { /* ignore */ }
+    try {
+      var tp = G.Objects['Temple'];
+      var pmg = tp && tp.minigame;
+      if (pmg && pmg.gods) {
+        var slots = [null, null, null];
+        for (var gid2 in pmg.gods) {
+          var gg2 = pmg.gods[gid2];
+          if (gg2 && typeof gg2.slot === 'number' && gg2.slot >= 0 && gg2.slot <= 2) slots[gg2.slot] = gg2.name || null;
+        }
+        status.pantheon = slots;
+        status.pantheonSwaps = (typeof pmg.swaps === 'number') ? Math.floor(pmg.swaps) : null;
+      }
     } catch (e) { /* ignore */ }
     // 周回（昇天）の記録: 昇天回数・完了した周回の一覧・進行中の周回の状態
     try {
@@ -3053,6 +3212,7 @@ function fmt(n) {
     }, 1500);
     setInterval(ascendStep, 2000);
     setInterval(goldenStep, 1500);
+    setInterval(spellStep, 2000);
     setInterval(renderPanel, 5000);
     setInterval(function () {
       gmSet('ccauto_lastBeat', Date.now());
