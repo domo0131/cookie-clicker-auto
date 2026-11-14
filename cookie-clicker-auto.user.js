@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.22
+// @version      2.3.23
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.22'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.23'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -85,6 +85,87 @@
     try {
       if (!gmGet('ccauto_ascendResume219', 0)) { gmSet('ccauto_autoAscend', '1'); gmSet('ccauto_ascendResume219', 1); }
     } catch (e) { /* ignore */ }
+  }
+
+  /* ================= 二重タブ防止（v2.3.23） =================
+     ゲームのタブが2つ開くと両タブが同じセーブ領域を共有し、古いタブのゲーム本体の
+     自動セーブが新しい状態を上書きして巻き戻る事故が起きた（2026-11-14、5回目の昇天が
+     取り消された）。対策（ChatGPT相談「対策設計レビュー」）:
+     - GM保存領域の「主タブ主張」を取り合う選挙で、自動操作する主タブを1つに決める
+     - ゲームの保存（Game.WriteSave の書き込み経路）は、主タブが確定するまで全タブで
+       遮断し、従タブでは恒常的に遮断する。自動操作を止めるだけでは、ゲーム本体の
+       自動セーブで巻き戻るため。WriteSave(1) は書き込まず文字列を返す書き出し経路
+       なので遮断しない（バックアップ取得は従タブでも安全）
+     - 従タブは購入・クリック・送信・昇天を行わない。主タブの主張が途絶えたら引き継ぐ
+     - タブIDは sessionStorage に保持し、再読み込みでは同じタブとして即座に復帰する */
+  var TAB_ID = (function () {
+    var fallback = 'tab-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e9).toString(36);
+    try {
+      var s = sessionStorage.getItem('ccauto_tabId');
+      if (s) return s;
+      sessionStorage.setItem('ccauto_tabId', fallback);
+    } catch (e) { /* ignore */ }
+    return fallback;
+  })();
+  var TAB_STALE_MS = 75000; // 主張がこの時間更新されなければ途絶えたとみなす（背面タブのタイマー抑制が約60秒あるため余裕を持たせる）
+  var tabState = { primary: false, decided: false, guardInstalled: false, autosaveOffByUs: false };
+
+  function tabClaimRead() {
+    var c = null;
+    try { c = gmGet('ccauto_tabClaim', null); } catch (e) { c = null; }
+    return (c && typeof c.at === 'number' && c.id) ? c : null;
+  }
+  function tabClaimWrite() {
+    try { gmSet('ccauto_tabClaim', { id: TAB_ID, at: Date.now() }); } catch (e) { /* ignore */ }
+  }
+  function tabSetRole(primary) {
+    var changed = (tabState.primary !== primary) || !tabState.decided;
+    tabState.primary = primary;
+    tabState.decided = true;
+    try {
+      var G = W.Game;
+      if (G && G.prefs) {
+        if (!primary && G.prefs.autosave) { G.prefs.autosave = 0; tabState.autosaveOffByUs = true; }
+        if (primary && tabState.autosaveOffByUs) { G.prefs.autosave = 1; tabState.autosaveOffByUs = false; }
+      }
+    } catch (e) { /* ignore */ }
+    if (changed) {
+      log(primary ? 'このタブが主タブとして動作します' : '別のタブが主タブのため、このタブは待機します（二重タブ防止）');
+      try { renderPanel(); } catch (e) { /* ignore */ }
+    }
+  }
+  function tabElect() {
+    var c = tabClaimRead();
+    var now = Date.now();
+    if (c && c.id !== TAB_ID && (now - c.at) < TAB_STALE_MS) { tabSetRole(false); return; }
+    tabClaimWrite();
+    setTimeout(function () {
+      var c2 = tabClaimRead();
+      tabSetRole(!!(c2 && c2.id === TAB_ID));
+    }, 1500);
+  }
+  function tabHeartbeat() {
+    if (!tabState.decided) return;
+    if (tabState.primary) { tabClaimWrite(); return; }
+    var c = tabClaimRead();
+    if (!c || (Date.now() - c.at) >= TAB_STALE_MS) tabElect();
+  }
+  function installSaveGuard() {
+    if (tabState.guardInstalled) return true;
+    try {
+      var G = W.Game;
+      if (!G || typeof G.WriteSave !== 'function') return false;
+      if (G.WriteSave.__ccautoGuard) { tabState.guardInstalled = true; return true; }
+      var orig = G.WriteSave;
+      var wrapped = function (type) {
+        if (type !== 1 && !tabState.primary) return undefined; // 書き込みは主タブだけ
+        return orig.apply(this, arguments);
+      };
+      wrapped.__ccautoGuard = true;
+      G.WriteSave = wrapped;
+      tabState.guardInstalled = true;
+      return true;
+    } catch (e) { return false; }
   }
 
   function saveState() {
@@ -1189,6 +1270,7 @@ function fmt(n) {
     return buyDelayHint;
   }
   function buyStepInner() {
+    if (!tabState.primary) return; // 二重タブ防止: 従タブは購入しない
     if (!state.running || state.mode !== 'auto') return;
     if (!gameReady() || isChallengePage()) return;
     if (ascendBusy()) return; // 自動昇天の実行中は通常の購入を止める
@@ -1500,6 +1582,7 @@ function fmt(n) {
 
   var clickLastAt = 0;
   function clickStep() {
+    if (!tabState.primary) return; // 二重タブ防止: 従タブはクリックしない
     if (!state.running) return;
     if (!gameReady() || isChallengePage()) return;
     if (ascendBusy()) return; // 自動昇天の実行中はクリックも止める
@@ -1537,6 +1620,7 @@ function fmt(n) {
   // クリックの見張り: 再読み込みなどでタイマーが止まったままになっていたら張り直す
   var clickWatchLast = -1, clickWatchFlatAt = 0;
   function clickWatchdog() {
+    if (!tabState.primary) { clickWatchLast = -1; clickWatchFlatAt = 0; return; } // 従タブはクリックしないのが正常
     if (!state.running || clickRate() <= 0) { clickWatchLast = -1; clickWatchFlatAt = 0; return; }
     if (!clickTimer) { scheduleClicks(); if (clickTimer) log('クリックのタイマーが止まっていたため再設定しました'); return; }
     if (!gameReady() || isChallengePage() || ascendBusy()) { clickWatchLast = -1; clickWatchFlatAt = 0; return; }
@@ -1561,6 +1645,7 @@ function fmt(n) {
   }
 
   function goldenStep() {
+    if (!tabState.primary) return; // 二重タブ防止: 従タブは触らない
     if (!state.running || !CONFIG.clickGolden) return;
     if (!gameReady() || isChallengePage()) return;
     if (ascendBusy()) return; // 自動昇天の実行中は黄金クッキーも触らない
@@ -1641,6 +1726,63 @@ function fmt(n) {
           tr.startedAt = 1794374880000; // 2026-11-11T14:28:00+09:00
         }
         gmSet('ccauto_runStartFix1', 1);
+      }
+    } catch (e) { /* ignore */ }
+    // 巻き戻し対策（v2.3.23）: 記録側（tr.resets）がゲーム（resets）より先に進んでいるのは、
+    // 二重タブ等でセーブが巻き戻った証拠。そのままでは再昇天しても記録されなくなるため、
+    // 完了扱いの記録を取り消し、記録をゲームの実態に合わせて巻き戻す
+    if (tr.resets > resets) {
+      var logR = [];
+      try { logR = gmGet('ccauto_runLog', []); } catch (e) { logR = []; }
+      if (!Array.isArray(logR)) logR = [];
+      var dropped = null;
+      var keptR = [];
+      for (var ri = 0; ri < logR.length; ri++) {
+        if ((logR[ri].run || 0) > resets) { if (!dropped) dropped = logR[ri]; }
+        else keptR.push(logR[ri]);
+      }
+      if (keptR.length !== logR.length) { try { gmSet('ccauto_runLog', keptR); } catch (e) { /* ignore */ } }
+      // 到達済みチェックポイントを、取り消した記録から復元する（巻き戻し検知の基準にする）
+      try {
+        var cpSeed = gmGet('ccauto_checkpoint', null);
+        if (dropped && (!cpSeed || typeof cpSeed.resets !== 'number')) {
+          var cumSeed = 0;
+          for (var si4 = 0; si4 < keptR.length; si4++) cumSeed += (keptR[si4].totalEarned || 0);
+          gmSet('ccauto_checkpoint', { resets: dropped.run || resets, prestige: prestigeLevelFor(cumSeed + (dropped.totalEarned || 0)), at: now });
+        }
+      } catch (e) { /* ignore */ }
+      var origStart = dropped ? Math.max(0, (dropped.endedAt || now) - (dropped.durationSec || 0) * 1000) : now;
+      tr = { resets: resets, startedAt: origStart || now, peakCps: Math.max(dropped ? (dropped.peakCps || 0) : 0, cpsNow || 0), lastTotal: totalEarned || 0 };
+      try { gmSet('ccauto_runTrack', tr); } catch (e) { /* ignore */ }
+      reportError('セーブの巻き戻しを検知し、周回記録を実態に合わせて修正しました（購入は継続します）');
+    }
+    // チェックポイント（v2.3.23）: 到達済みの (resets, prestige) の最大値を保持し、それを下回る
+    // 状態は巻き戻しとして一度だけ報告する。購入・クリック・昇天は止めない（巻き戻し先で
+    // 再昇天して追いつくのが復旧経路のため）。追いついたら自動でフラグを下ろす
+    try {
+      var prestigeNow = 0;
+      try { prestigeNow = Math.floor(G.prestige || 0); } catch (e) { prestigeNow = 0; }
+      var cp = null;
+      try { cp = gmGet('ccauto_checkpoint', null); } catch (e) { cp = null; }
+      if (!cp || typeof cp.resets !== 'number') {
+        try { gmSet('ccauto_checkpoint', { resets: resets, prestige: prestigeNow, at: now }); } catch (e) { /* ignore */ }
+      } else if (resets === 0 && prestigeNow === 0 && cp.resets > 0) {
+        // セーブの初期化（ワイプ・新規開始）は新しい系列として扱い、巻き戻しとはみなさない
+        try { gmSet('ccauto_checkpoint', { resets: 0, prestige: 0, at: now }); } catch (e) { /* ignore */ }
+        try { gmSet('ccauto_rollbackSeen', 0); } catch (e) { /* ignore */ }
+      } else if (resets < cp.resets || (resets === cp.resets && prestigeNow < cp.prestige)) {
+        if (gmGet('ccauto_rollbackSeen', 0) !== 1) {
+          gmSet('ccauto_rollbackSeen', 1);
+          reportError('セーブの巻き戻しを検知しました（到達済み: 昇天 ' + cp.resets + ' 回／プレステージ ' + cp.prestige + '）。再昇天で追いつくまで記録を保護します（購入は継続します）');
+        }
+      } else {
+        if (gmGet('ccauto_rollbackSeen', 0) === 1) {
+          gmSet('ccauto_rollbackSeen', 0);
+          log('巻き戻しから回復しました（記録が到達済みに追いつきました）');
+        }
+        if (resets > cp.resets || prestigeNow > cp.prestige) {
+          try { gmSet('ccauto_checkpoint', { resets: resets, prestige: prestigeNow, at: now }); } catch (e) { /* ignore */ }
+        }
       }
     } catch (e) { /* ignore */ }
     if (resets > tr.resets) {
@@ -1741,6 +1883,8 @@ function fmt(n) {
     };
     status.scriptVersion = SCRIPT_VERSION;
     try { status.autoAscend = (gmGet('ccauto_autoAscend', '1') === '1'); } catch (e) { status.autoAscend = false; }
+    try { status.tabRole = tabState.primary ? 'primary' : 'follower'; } catch (e) { /* ignore */ }
+    try { status.rolledBack = gmGet('ccauto_rollbackSeen', 0) === 1; } catch (e) { /* ignore */ }
     // 周回（昇天）の記録: 昇天回数・完了した周回の一覧・進行中の周回の状態
     try {
       var runInfo = trackRun(G, status.cps || status.cpsRaw || 0, status.totalEarned || 0);
@@ -1798,6 +1942,7 @@ function fmt(n) {
   var lastSentSave = '';
   var reportInFlight = false;
   function reportStep() {
+    if (!tabState.primary) return; // 二重タブ防止: 従タブは送信しない（同じ状態の二重送信を防ぐ）
     if (reportInFlight) return; // 通信中は重ねて送らない（受信側での競合・重複を防ぐ）
     if (!gameReady() || isChallengePage()) return;
     if (typeof GM_xmlhttpRequest !== 'function') return;
@@ -2065,6 +2210,7 @@ function fmt(n) {
     panel.style.maxWidth = mini ? '240px' : '270px';
     var modeLabel = (state.mode === 'auto') ? '自動購入' : '読み取り専用';
     var runLabel = state.halted ? '購入停止中（異常検知）' : (state.running ? '稼働中' : '停止中');
+    if (tabState.decided && !tabState.primary) runLabel = '別のタブで動作中（二重タブ防止）';
     var statsTxt = '';
     if (gameReady()) {
       statsTxt = '所持 ' + fmt(W.Game.cookies) + ' / CpS ' + fmt(baseCps()) +
@@ -2449,14 +2595,61 @@ function fmt(n) {
     });
     return arr.slice(0, Math.max(0, n));
   }
+  // 永久スロットの自己修復（v2.3.23）: 新しく買った永久スロットは、転生後にゲーム側の
+  // 選択ダイアログが開いたまま残り、割り当ても空に見えることがある（2026-11-14 実測）。
+  // 直前の昇天フローが記録した割り当て（ccauto_ascendLast.slot）を正として空きを埋め、
+  // ダイアログが残っていれば閉じる（ダイアログはクリックを遮るため）
+  function slotHeal(G) {
+    try {
+      if ((G.resets || 0) <= 0 || G.OnAscend === 1) return;
+      var n = slotCountOwned(G);
+      if (n <= 0 || !G.permanentUpgrades) return;
+      var filled = [];
+      var last = null;
+      try { last = gmGet('ccauto_ascendLast', null); } catch (e) { last = null; }
+      if (last && last.slot && Date.now() - (last.at || 0) < 30 * 60 * 1000) {
+        var names = String(last.slot).split('、');
+        var usedH = {};
+        var hi;
+        for (hi = 0; hi < n; hi++) { if (G.permanentUpgrades[hi]) usedH[G.permanentUpgrades[hi]] = 1; }
+        for (hi = 0; hi < n; hi++) {
+          if (G.permanentUpgrades[hi]) continue;
+          for (var ni = 0; ni < names.length; ni++) {
+            var upH = findUpgrade(G, names[ni]);
+            if (upH && !usedH[upH.id]) {
+              G.permanentUpgrades[hi] = upH.id;
+              usedH[upH.id] = 1;
+              filled.push(names[ni]);
+              break;
+            }
+          }
+        }
+      }
+      var promptEl = null;
+      try { promptEl = document.getElementById('prompt'); } catch (e) { promptEl = null; }
+      var slotPromptOpen = !!(promptEl && promptEl.textContent && promptEl.textContent.indexOf('永久に持続') >= 0);
+      if (filled.length) {
+        log('永久スロットの空きに ' + filled.join('、') + ' を割り当てました');
+        var keyH = 'ccauto_slotHealNote_' + (G.resets || 0);
+        if (!gmGet(keyH, '')) {
+          gmSet(keyH, '1');
+          reportError('永久スロットが空だったため自動で割り当てました: ' + filled.join('、'));
+        }
+      }
+      if ((filled.length || slotPromptOpen) && typeof G.ClosePrompt === 'function') {
+        try { G.ClosePrompt(); } catch (e) { /* ignore */ }
+      }
+    } catch (e) { /* ignore */ }
+  }
   function ascendStep() {
+    if (!tabState.primary) return; // 二重タブ防止: 従タブは昇天処理をしない
     if (!gameReady() || isChallengePage()) return;
     var G = W.Game;
     var f = ascendFlow();
     // 前の周回で完了したフロー記録が残っていると、ここで永久に戻ってしまい
     // 2周目以降の開始判定に一生たどり着けない。完了済みで自分の周回より前のものは「フローなし」として扱う
     if (f && f.phase === 'done' && (f.run || 0) <= (G.resets || 0)) f = null;
-    if (!f) { ascendMaybeStart(G); return; }
+    if (!f) { slotHeal(G); ascendMaybeStart(G); return; }
     if (f.phase === 'done') return;
     if (f.phase === 'stuck') {
       // 再読み込みで止まった場合だけ、昇天が「実行されていない」と証明できれば復旧する。
@@ -2654,6 +2847,13 @@ function fmt(n) {
     }
     buildPanel();
     renderPanel();
+    // 二重タブ防止（v2.3.23）: 主タブの選挙・維持と、ゲーム保存の遮断ガードの設置
+    tabElect();
+    setInterval(tabHeartbeat, 5000);
+    installSaveGuard();
+    var guardTimer = setInterval(function () {
+      if (installSaveGuard()) clearInterval(guardTimer);
+    }, 1000);
     log('スクリプトを開始しました（モード: ' + state.mode + '）');
     // 以前の版で立った購入停止フラグは引き継がない（止まらない運用に変更したため）
     if (state.halted) { state.halted = false; gmSet('ccauto_halted', 0); }
