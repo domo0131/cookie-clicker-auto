@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.17
+// @version      2.3.18
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -36,7 +36,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.17'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.18'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -74,6 +74,11 @@
     if (!gmGet('ccauto_approvedVersion', '')) state.mode = 'readonly';
     // 新しい版では効果測定の停止フラグを解除して再挑戦する（直した版で実測を復活させるため）
     try { gmSet('ccauto_bSimDisabled', 0); gmSet('ccauto_simDisabled', 0); gmSet('ccauto_bSimOff', '{}'); } catch (e) { /* ignore */ }
+    // v2.3.18: チップ計算の実績化に伴い、計算の一致確認が済むまで自動昇天を一時停止する
+    // （購入・クリックは止めない。確認後に有効化する。一度だけ適用）
+    try {
+      if (!gmGet('ccauto_ascendHold218', 0)) { gmSet('ccauto_autoAscend', '0'); gmSet('ccauto_ascendHold218', 1); }
+    } catch (e) { /* ignore */ }
   }
 
   function saveState() {
@@ -1537,6 +1542,11 @@ function fmt(n) {
 
   // 周回（昇天）ごとの記録。昇天回数・獲得チップ・所要時間・最高CpSを周回ごとに残し、
   // スペースの「周回ごとの効率」グラフの元データとして状態送信に載せる
+  // 累計クッキーからプレステージレベルを求める（ゲームの換算と同じ三乗根。境界の検証・予備用）
+  function prestigeLevelFor(totalCookies) {
+    return Math.floor(Math.cbrt(Math.max(0, totalCookies || 0) / 1e12));
+  }
+
   function trackRun(G, cpsNow, totalEarned) {
     var resets = 0;
     try { resets = G.resets || 0; } catch (e) { resets = 0; }
@@ -1563,10 +1573,15 @@ function fmt(n) {
       var logArr = [];
       try { logArr = gmGet('ccauto_runLog', []); } catch (e) { logArr = []; }
       if (!Array.isArray(logArr)) logArr = [];
-      var chips = Math.floor(Math.cbrt(Math.max(0, tr.lastTotal || 0) / 1e12));
+      // chips は「その周回で実際に増えたプレステージ」= 累計レベルの増加分（v2.3.18で実績化。
+      // 旧方式の周回単独の三乗根は legacyChips に残す）
+      var cumBefore = 0;
+      for (var ci = 0; ci < logArr.length; ci++) cumBefore += (logArr[ci].totalEarned || 0);
+      var chips = Math.max(0, prestigeLevelFor(cumBefore + (tr.lastTotal || 0)) - prestigeLevelFor(cumBefore));
       logArr.push({
         run: tr.resets + 1,
         chips: chips,
+        legacyChips: Math.floor(Math.cbrt(Math.max(0, tr.lastTotal || 0) / 1e12)),
         durationSec: Math.max(0, Math.round((now - (tr.startedAt || now)) / 1000)),
         peakCps: Math.round(tr.peakCps || 0),
         totalEarned: Math.round(tr.lastTotal || 0),
@@ -1579,6 +1594,34 @@ function fmt(n) {
     if (cpsNow > (tr.peakCps || 0)) tr.peakCps = cpsNow;
     if (totalEarned > 0) tr.lastTotal = totalEarned;
     try { gmSet('ccauto_runTrack', tr); } catch (e) { /* ignore */ }
+    // 一回限りの補正（v2.3.18）: 過去の周回記録の chips を実績（累計レベルの増加分）へ直す。
+    // 旧値は legacyChips に残す。合計がゲームの prestige と小さくずれる場合は最後の周回で吸収する
+    try {
+      if (!gmGet('ccauto_chipsFix218', 0)) {
+        var fixArr = [];
+        try { fixArr = gmGet('ccauto_runLog', []); } catch (e) { fixArr = []; }
+        if (Array.isArray(fixArr) && fixArr.length) {
+          var cumF = 0, sumF = 0;
+          for (var fi = 0; fi < fixArr.length; fi++) {
+            var recF = fixArr[fi];
+            if (typeof recF.legacyChips !== 'number') recF.legacyChips = recF.chips;
+            recF.chips = Math.max(0, prestigeLevelFor(cumF + (recF.totalEarned || 0)) - prestigeLevelFor(cumF));
+            cumF += (recF.totalEarned || 0);
+            sumF += recF.chips;
+          }
+          var pgF = 0;
+          try { pgF = Math.floor(G.prestige || 0); } catch (e) { pgF = 0; }
+          if (pgF > 0 && sumF !== pgF) {
+            var diffF = pgF - sumF;
+            if (Math.abs(diffF) <= 10) { fixArr[fixArr.length - 1].chips += diffF; }
+            else { reportError('チップ記録の補正: 合計とプレステージが大きくずれています（差 ' + diffF + '）'); }
+          }
+          try { gmSet('ccauto_runLog', fixArr); } catch (e) { /* ignore */ }
+        }
+        try { gmSet('ccauto_chipSamples', []); } catch (e) { /* ignore */ }
+        gmSet('ccauto_chipsFix218', 1);
+      }
+    } catch (e) { /* ignore */ }
     var runLogArr = [];
     try { runLogArr = gmGet('ccauto_runLog', []); } catch (e) { runLogArr = []; }
     return {
@@ -1588,7 +1631,7 @@ function fmt(n) {
         run: resets + 1,
         startedAt: tr.startedAt || now,
         peakCps: Math.round(tr.peakCps || 0),
-        chipsNow: Math.floor(Math.cbrt(Math.max(0, totalEarned || 0) / 1e12))
+        chipsNow: pendingChips(G)
       }
     };
   }
@@ -1617,6 +1660,7 @@ function fmt(n) {
       buildings: buildings,
       lumps: (typeof G.lumps === 'number') ? G.lumps : 0,
       heavenlyChips: (typeof G.heavenlyChips === 'number') ? Math.floor(G.heavenlyChips) : 0,
+      prestige: (typeof G.prestige === 'number') ? Math.floor(G.prestige) : 0,
       mode: state.mode, running: state.running, lastAction: state.lastAction || '',
       recentLogs: (state.logs || []).slice(0, 15)
     };
@@ -2132,11 +2176,27 @@ function fmt(n) {
     try { if (W.Game && W.Game.OnAscend === 1) return true; } catch (e) { /* ignore */ }
     return false;
   }
-  function chipsThisRun(G) {
-    var t = 0;
-    try { t = G.cookiesEarned || 0; } catch (e) { t = 0; }
-    return Math.floor(Math.cbrt(Math.max(0, t) / 1e12));
+  // 「今昇天したら新規に得られるチップ数」。ゲーム自身の換算（HowMuchPrestige）を使い、
+  // 過去周回累計 cookiesReset + 今周回 cookiesEarned のレベルから、確定済み prestige を引く。
+  // 旧方式（今周回の稼ぎだけで三乗根）は実付与と大きくずれるため使わない
+  // （2026-11-14 実測: 3周目で表示18,845に対し実績4,191。ChatGPT相談「チップ計算修正設計」）
+  function pendingChips(G) {
+    try {
+      if (typeof G.HowMuchPrestige === 'function') {
+        var lvl = Math.floor(G.HowMuchPrestige(Math.max(0, G.cookiesReset || 0) + Math.max(0, G.cookiesEarned || 0)));
+        var gain = lvl - Math.floor(G.prestige || 0);
+        if (isFinite(gain)) return Math.max(0, gain);
+      }
+    } catch (e) { /* フォールバックへ */ }
+    // フォールバック: 保存済みの完了周回の totalEarned 合計から累計を再構成する
+    try {
+      var logArr = gmGet('ccauto_runLog', []);
+      var cum = 0;
+      if (Array.isArray(logArr)) { for (var i = 0; i < logArr.length; i++) cum += (logArr[i].totalEarned || 0); }
+      return Math.max(0, prestigeLevelFor(cum + (G.cookiesEarned || 0)) - prestigeLevelFor(cum));
+    } catch (e) { return 0; }
   }
+  function chipsThisRun(G) { return pendingChips(G); }
   function ascendTargetFor(G) {
     var run = (G.resets || 0) + 1;
     if (ASCEND_TARGETS[run]) return ASCEND_TARGETS[run];
