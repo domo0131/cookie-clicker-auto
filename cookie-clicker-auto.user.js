@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.27
+// @version      2.3.28
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.27'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.28'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1692,6 +1692,13 @@ function fmt(n) {
      配置・付け替えで生産が変わるため、付け替え時は購入評価のキャッシュを捨てる。 */
   var spellState = { lastCastKey: '', lastAttempt: 0, pantheonAt: 0 };
 
+  // 魔力の上限はプロパティではなく computeMagicMax() で求める形式だった（v2.3.27 実測で判明）
+  function grimoireMagicMax(mg) {
+    try { if (mg && typeof mg.computeMagicMax === 'function') return mg.computeMagicMax() || 0; } catch (e) { /* ignore */ }
+    try { if (mg && typeof mg.magicMax === 'number' && mg.magicMax > 0) return mg.magicMax; } catch (e) { /* ignore */ }
+    return 0;
+  }
+
   function spellStats() {
     try { return JSON.parse(gmGet('ccauto_spellStats', '') || '{}'); } catch (e) { return {}; }
   }
@@ -1724,10 +1731,17 @@ function fmt(n) {
       var god = findGod(mg, tg.match);
       if (!god || god.slot === tg.slot) continue;
       if (typeof mg.swaps === 'number' && mg.swaps < 1) continue; // 付け替え回数が無い
+      if (typeof mg.slotGod !== 'function') {
+        try { gmSet('ccauto_pantheonDebug', 'slotGod not a function (typeof=' + typeof mg.slotGod + ')'); } catch (e) { /* ignore */ }
+        continue;
+      }
       try { mg.slotGod(god, tg.slot); } catch (e) { /* ignore */ }
       if (god.slot === tg.slot) {
         changed = true;
         log('パンテオン配置: ' + tg.match + ' → ' + tg.label);
+      } else {
+        // 呼べたのに配置されなかった場合の診断材料を残す（v2.3.28）
+        try { gmSet('ccauto_pantheonDebug', 'slotGod(' + tg.match + ',' + tg.slot + ') called but slot=' + god.slot + ' swaps=' + mg.swaps); } catch (e) { /* ignore */ }
       }
     }
     if (changed) {
@@ -1773,7 +1787,7 @@ function fmt(n) {
       var key = 'fz' + Math.round((Date.now() + remainSec * 1000) / 1000);
       if (spellState.lastCastKey === key) return; // 同じFrenzyでは1回だけ
       if (Date.now() - spellState.lastAttempt < 60000) return;
-      var max = (typeof mg.magicMax === 'number') ? mg.magicMax : 0;
+      var max = grimoireMagicMax(mg);
       var magic = (typeof mg.magic === 'number') ? mg.magic : 0;
       if (max <= 0) return;
       var cost = null;
@@ -2038,8 +2052,10 @@ function fmt(n) {
       var gsState = 'unknown';
       if (typeof G.switchGolden === 'number') gsState = G.switchGolden ? 'on' : 'off';
       else if (typeof G.switchGolden === 'boolean') gsState = G.switchGolden ? 'on' : 'off';
-      else if (findUpgrade(G, 'Golden switch [on]')) gsState = 'on'; // v2.3.27: アイテム名からも判定
-      else if (findUpgrade(G, 'Golden switch [off]')) gsState = 'off';
+      // v2.3.28: 実測で補正 — '[on]' のアイテムがある状態でも黄金クッキーは出現していた
+      // （=スイッチはOFF）。表示名は「押すとどうなるか」を表すため、逆に読む。
+      else if (findUpgrade(G, 'Golden switch [on]')) gsState = 'off';
+      else if (findUpgrade(G, 'Golden switch [off]')) gsState = 'on';
       status.goldenSwitch = gsState;
       if (gsState === 'on') {
         if (gmGet('ccauto_gsWarned', 0) !== 1) {
@@ -2070,7 +2086,7 @@ function fmt(n) {
       if (gmg) {
         var ss = spellStats();
         status.grimoire = {
-          magic: Math.floor(gmg.magic || 0), magicMax: Math.floor(gmg.magicMax || 0),
+          magic: Math.floor(gmg.magic || 0), magicMax: Math.floor(grimoireMagicMax(gmg)),
           casts: ss.casts || 0, golden: ss.golden || 0, wrath: ss.wrath || 0, failed: ss.failed || 0
         };
       }
@@ -2086,6 +2102,12 @@ function fmt(n) {
         }
         status.pantheon = slots;
         status.pantheonSwaps = (typeof pmg.swaps === 'number') ? Math.floor(pmg.swaps) : null;
+        // 配置できない原因の切り分け用（v2.3.28）
+        try {
+          var gdb = [];
+          for (var gid3 in pmg.gods) { var gg3 = pmg.gods[gid3]; if (gg3) gdb.push({ id: gid3, name: gg3.name || '', slot: gg3.slot }); }
+          status.pantheonDebug = { slotGod: typeof pmg.slotGod, gods: gdb, note: gmGet('ccauto_pantheonDebug', '') || '' };
+        } catch (e) { /* ignore */ }
       }
     } catch (e) { /* ignore */ }
     // 周回（昇天）の記録: 昇天回数・完了した周回の一覧・進行中の周回の状態
