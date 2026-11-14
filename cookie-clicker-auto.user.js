@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.28
+// @version      2.3.29
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.28'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.29'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -348,16 +348,15 @@ function fmt(n) {
     // 'slotted'（配置中）/ 'none'（未配置で確定）/ 'unknown'（判定不能）の3状態。
     // 'none' のときだけ黄金クッキーをクリックしてよい。
     // v2.3.27: パンテオンを直接読む（Game.hasGod の有無に依存しない）
+    // v2.3.29: asceticism の slot が実際に読めた場合だけ確定する（読めないのに
+    // none と言い切る穴を塞ぐ。ChatGPTレビューに基づく）
     try {
       var tt = W.Game.Objects['Temple'];
       var tmg = tt && tt.minigame;
       if (tmg && tmg.gods) {
-        for (var gid in tmg.gods) {
-          var gg = tmg.gods[gid];
-          if (gg && typeof gg.slot === 'number' && gg.slot !== -1 &&
-              (gid === 'asceticism' || (gg.name || '').indexOf('Holobore') >= 0)) return 'slotted';
-        }
-        return 'none';
+        var asc = tmg.gods['asceticism'];
+        if (asc && typeof asc.slot === 'number') return asc.slot === -1 ? 'none' : 'slotted';
+        // 読めなかった場合は下のフォールバックへ（最終的に unknown 寄りに倒れる）
       }
     } catch (e) { /* fallthrough */ }
     try {
@@ -1293,7 +1292,7 @@ function fmt(n) {
     if (state.pendingVerify) {
       if (!state.pendingVerify.at) state.pendingVerify.at = Date.now();
       var recalcOn = false;
-      try { recalcOn = (typeof W.Game.recalculateGains === 'number') && W.Game.recalculateGains !== 0; } catch (e) { recalcOn = false; }
+      try { recalcOn = !!W.Game.recalculateGains; } catch (e) { recalcOn = false; } // v2.3.29: 真偽値で立つ経路も拾う
       if (recalcOn) {
         if (Date.now() - state.pendingVerify.at < 4000) { buyDelayHint = 75; renderPanel(); return; }
         log('検証メモ: ' + state.pendingVerify.label + ' は再計算が終わらないため判定しませんでした');
@@ -1690,13 +1689,27 @@ function fmt(n) {
      Click Frenzyとの重なりを狙う。出た憤怒は goldenStep が元々触らない。
      パンテオン: ダイヤ=Muridal（クリック強化）、ヒスイ=Mokalsium、ルビーは空。
      配置・付け替えで生産が変わるため、付け替え時は購入評価のキャッシュを捨てる。 */
-  var spellState = { lastCastKey: '', lastAttempt: 0, pantheonAt: 0 };
+  var spellState = { lastCastKey: '', lastAttempt: 0, pantheonAt: 0, lastSkip: '', lastCost: null };
 
-  // 魔力の上限はプロパティではなく computeMagicMax() で求める形式だった（v2.3.27 実測で判明）
+  // 魔力の上限は mg.magicM（v2.3.29: ChatGPTが公開実装と照合して確定。
+  // computeMagicM() は magicM を更新する関数で、戻り値は上限ではない）
   function grimoireMagicMax(mg) {
-    try { if (mg && typeof mg.computeMagicMax === 'function') return mg.computeMagicMax() || 0; } catch (e) { /* ignore */ }
+    try { if (mg && typeof mg.magicM === 'number' && mg.magicM > 0) return mg.magicM; } catch (e) { /* ignore */ }
+    try {
+      if (mg && typeof mg.computeMagicM === 'function') {
+        mg.computeMagicM();
+        if (typeof mg.magicM === 'number' && mg.magicM > 0) return mg.magicM;
+      }
+    } catch (e) { /* ignore */ }
     try { if (mg && typeof mg.magicMax === 'number' && mg.magicMax > 0) return mg.magicMax; } catch (e) { /* ignore */ }
     return 0;
+  }
+
+  // 呪文コストは mg.getSpellCost(spell) が正（無ければ旧候補、それも無ければ null）
+  function spellCostOf(mg, spell) {
+    try { if (mg && typeof mg.getSpellCost === 'function') { var c = mg.getSpellCost(spell); if (typeof c === 'number' && c > 0) return c; } } catch (e) { /* ignore */ }
+    try { if (mg && typeof mg.computeSpellCost === 'function') { var c2 = mg.computeSpellCost(spell); if (typeof c2 === 'number' && c2 > 0) return c2; } } catch (e) { /* ignore */ }
+    return null;
   }
 
   function spellStats() {
@@ -1710,51 +1723,62 @@ function fmt(n) {
     } catch (e) { /* ignore */ }
   }
 
-  function findGod(mg, match) {
-    try {
-      for (var gid in mg.gods) {
-        var g = mg.gods[gid];
-        if (g && (g.name || '').indexOf(match) >= 0) return g;
-      }
-    } catch (e) { /* ignore */ }
-    return null;
-  }
-
   function pantheonMaintain(G) {
     var t = G.Objects['Temple'];
     var mg = t && t.minigame;
     if (!mg || !mg.gods || typeof mg.slotGod !== 'function') return;
-    var targets = [{ match: 'Muridal', slot: 0, label: 'ダイヤ' }, { match: 'Mokalsium', slot: 2, label: 'ヒスイ' }];
+    // v2.3.29: 照合は表示名ではなく gods のキー（id）で行う。日本語版では表示名が
+    // 日本語化されており、英語名の部分一致では永遠に一致しなかった（実測で判明）。
+    // labor = Muridal（クリック強化）、mother = Mokalsium。最終形は [labor, 空, mother]。
+    var targets = [{ id: 'labor', slot: 0, label: 'ダイヤ' }, { id: 'mother', slot: 2, label: 'ヒスイ' }];
     var changed = false;
+    function tryPlace(god, slot) {
+      if (!god || god.slot === slot) return false;
+      if (typeof mg.swaps === 'number' && mg.swaps < 1) return false; // 付け替え回数が無い
+      var swapsBefore = (typeof mg.swaps === 'number') ? mg.swaps : null;
+      try { mg.slotGod(god, slot); } catch (e) { return false; }
+      if (god.slot !== slot) {
+        try { gmSet('ccauto_pantheonDebug', 'slotGod(' + (god.name || '?') + ',' + slot + ') called but slot=' + god.slot + ' swaps=' + mg.swaps); } catch (e) { /* ignore */ }
+        return false;
+      }
+      // slotGod は交換回数を消費しない（通常の配置経路は別途 useSwap を呼ぶ）ため、
+      // 消費されていなければ通常経路に合わせて1回分消費する（ChatGPTレビューに基づく）
+      if (swapsBefore !== null && mg.swaps === swapsBefore && typeof mg.useSwap === 'function') {
+        try { mg.useSwap(1); } catch (e) { /* ignore */ }
+      }
+      return true;
+    }
     for (var i = 0; i < targets.length; i++) {
       var tg = targets[i];
-      var god = findGod(mg, tg.match);
-      if (!god || god.slot === tg.slot) continue;
-      if (typeof mg.swaps === 'number' && mg.swaps < 1) continue; // 付け替え回数が無い
-      if (typeof mg.slotGod !== 'function') {
-        try { gmSet('ccauto_pantheonDebug', 'slotGod not a function (typeof=' + typeof mg.slotGod + ')'); } catch (e) { /* ignore */ }
-        continue;
-      }
-      try { mg.slotGod(god, tg.slot); } catch (e) { /* ignore */ }
-      if (god.slot === tg.slot) {
+      var god = null;
+      try { god = mg.gods[tg.id]; } catch (e) { god = null; }
+      if (tryPlace(god, tg.slot)) {
         changed = true;
-        log('パンテオン配置: ' + tg.match + ' → ' + tg.label);
-      } else {
-        // 呼べたのに配置されなかった場合の診断材料を残す（v2.3.28）
-        try { gmSet('ccauto_pantheonDebug', 'slotGod(' + tg.match + ',' + tg.slot + ') called but slot=' + god.slot + ' swaps=' + mg.swaps); } catch (e) { /* ignore */ }
+        log('パンテオン配置: ' + (god.name || tg.id) + ' → ' + tg.label);
       }
     }
+    // ルビー（slot 1）は空にする: 対象外の神が入っていたら外す
+    try {
+      for (var gid in mg.gods) {
+        var g2 = mg.gods[gid];
+        if (g2 && g2.slot === 1) {
+          if (tryPlace(g2, -1)) { changed = true; log('パンテオン配置: ルビーを空けました（' + (g2.name || gid) + ' を外しました）'); }
+        }
+      }
+    } catch (e) { /* ignore */ }
     if (changed) {
       try { evalCache = null; upGainCache = {}; bGainCache = {}; } catch (e) { /* ignore */ }
     }
-    // 配置が揃ったら周回ごとに1回だけ記録する
+    // 配置が揃ったら周回ごとに1回だけ記録する（3枠すべてを確認）
     try {
-      var m1 = findGod(mg, 'Muridal'), m2 = findGod(mg, 'Mokalsium');
-      if (m1 && m1.slot === 0 && m2 && m2.slot === 2) {
+      var m1 = mg.gods['labor'], m2 = mg.gods['mother'];
+      var rubyEmpty = true;
+      for (var gid2 in mg.gods) { if (mg.gods[gid2] && mg.gods[gid2].slot === 1) rubyEmpty = false; }
+      if (m1 && m1.slot === 0 && m2 && m2.slot === 2 && rubyEmpty) {
         var rk = 'r' + (G.resets || 0);
         if (gmGet('ccauto_pantheonRun', '') !== rk) {
           gmSet('ccauto_pantheonRun', rk);
-          log('パンテオン配置完了: ダイヤ=Muridal（クリック強化）, ヒスイ=Mokalsium');
+          log('パンテオン配置完了: ダイヤ=Muridal（クリック強化）, ヒスイ=Mokalsium, ルビー=空');
         }
       }
     } catch (e) { /* ignore */ }
@@ -1775,44 +1799,61 @@ function fmt(n) {
     try {
       var tower = G.Objects['Wizard tower'];
       var mg = tower && tower.minigame;
-      if (!mg || !mg.spells) return;
+      if (!mg || !mg.spells) { spellState.lastSkip = 'noGrimoire'; return; }
       var spell = mg.spells['hand of fate'];
-      if (!spell) return;
+      if (!spell) { spellState.lastSkip = 'noSpell'; return; }
+      // Holobore配置中（または判定不能）は黄金を回収できないので魔力を使わない
+      if (holoboreState() !== 'none') { spellState.lastSkip = 'holobore'; return; }
       var frenzy = (G.buffs || {})['Frenzy'];
-      if (!frenzy) return;
+      if (!frenzy) { spellState.lastSkip = 'noFrenzy'; return; }
       var fps = G.fps || 30;
       var remainSec = (frenzy.time || 0) / fps;
-      if (remainSec < 15) return; // 残り短いFrenzyでは撃たない
-      if ((G.shimmers || []).length > 0) return; // 画面にクッキーがある間は撃たない
+      if (remainSec < 15) { spellState.lastSkip = 'shortFrenzy'; return; } // 残り短いFrenzyでは撃たない
+      // 画面に黄金系が出ている間は撃たない（トナカイ等は対象外）
+      var shNow = G.shimmers || [];
+      var goldenOut = false;
+      for (var shi = 0; shi < shNow.length; shi++) { if (shNow[shi] && shNow[shi].type === 'golden') { goldenOut = true; break; } }
+      if (goldenOut) { spellState.lastSkip = 'shimmerOut'; return; }
       var key = 'fz' + Math.round((Date.now() + remainSec * 1000) / 1000);
-      if (spellState.lastCastKey === key) return; // 同じFrenzyでは1回だけ
-      if (Date.now() - spellState.lastAttempt < 60000) return;
+      if (spellState.lastCastKey === key) { spellState.lastSkip = 'sameFrenzy'; return; } // 同じFrenzyでは1回だけ
+      if (Date.now() - spellState.lastAttempt < 60000) { spellState.lastSkip = 'cooldown'; return; }
+      if (Date.now() - (gmGet('ccauto_lastCastAt', 0) || 0) < 90000) { spellState.lastSkip = 'castGuard'; return; } // 再読み込みをまたいでも連射しない
       var max = grimoireMagicMax(mg);
       var magic = (typeof mg.magic === 'number') ? mg.magic : 0;
-      if (max <= 0) return;
-      var cost = null;
-      if (typeof mg.computeSpellCost === 'function') { try { cost = mg.computeSpellCost(spell); } catch (e) { cost = null; } }
-      if (typeof cost !== 'number' || !(cost > 0)) cost = max; // 計算できない場合は満タンのときだけ
-      if (magic < cost) return;
+      if (max <= 0) { spellState.lastSkip = 'noMax'; return; }
+      var cost = spellCostOf(mg, spell);
+      spellState.lastCost = cost;
+      if (cost === null) { spellState.lastSkip = 'costUnknown'; return; } // コストが取れない場合は撃たない（ChatGPTレビュー）
+      if (magic < cost) { spellState.lastSkip = 'lowMagic'; return; }
       spellState.lastAttempt = Date.now();
       spellState.lastCastKey = key;
-      var beforeSet = (G.shimmers || []).slice();
+      spellState.lastSkip = '';
+      // 成否は同期で判定する（召喚も魔力消費も同期処理のため。v2.3.29で400ms遅延判定を廃止）
+      var totalBefore = (typeof mg.spellsCastTotal === 'number') ? mg.spellsCastTotal : null;
       var magicBefore = magic;
-      try { mg.castSpell(spell); } catch (e) { /* 成否は魔力と出現で判定する */ }
+      var beforeSet = (G.shimmers || []).slice();
+      var ret = null;
+      try { ret = mg.castSpell(spell); } catch (e) { ret = null; }
+      var magicAfter = (typeof mg.magic === 'number') ? mg.magic : magicBefore;
+      var totalAfter = (typeof mg.spellsCastTotal === 'number') ? mg.spellsCastTotal : null;
+      var fresh = null;
+      var arrA = G.shimmers || [];
+      for (var ai2 = 0; ai2 < arrA.length; ai2++) { if (beforeSet.indexOf(arrA[ai2]) < 0) { fresh = arrA[ai2]; break; } }
+      var success = (ret === true) ||
+        (totalBefore !== null && totalAfter !== null && totalAfter > totalBefore) ||
+        (magicBefore - magicAfter >= 1);
       spellStatsBump('casts');
-      log('グリモア: 運命の手を詠唱（Frenzy残り約' + Math.round(remainSec) + '秒）');
-      setTimeout(function () {
-        try {
-          var after = W.Game.shimmers || [];
-          var fresh = null;
-          for (var i = 0; i < after.length; i++) { if (beforeSet.indexOf(after[i]) < 0) { fresh = after[i]; break; } }
-          var mg2 = W.Game.Objects['Wizard tower'].minigame;
-          var dropped = mg2 && typeof mg2.magic === 'number' ? (magicBefore - mg2.magic) : 0;
-          if (fresh && fresh.wrath) { spellStatsBump('wrath'); log('運命の手: 憤怒クッキーが出現（触りません）'); }
-          else if (fresh) { spellStatsBump('golden'); log('運命の手: 黄金クッキーが出現'); }
-          else if (dropped < 1) { spellStatsBump('failed'); log('運命の手: 詠唱できなかったようです'); }
-        } catch (e) { /* ignore */ }
-      }, 400);
+      log('グリモア: 運命の手を詠唱（Frenzy残り約' + Math.round(remainSec) + '秒、コスト ' + Math.floor(cost) + '）');
+      if (success) {
+        spellStatsBump('success');
+        try { gmSet('ccauto_lastCastAt', Date.now()); } catch (e) { /* ignore */ }
+        if (fresh && fresh.wrath) { spellStatsBump('wrath'); log('運命の手: 逆発動で憤怒クッキーが出現（触りません）'); }
+        else if (fresh) { spellStatsBump('golden'); log('運命の手: 黄金クッキーが出現'); }
+        else { log('運命の手: 詠唱成立（出現は未確認）'); }
+      } else {
+        spellStatsBump('failed');
+        log('運命の手: 詠唱できませんでした');
+      }
     } catch (e) { /* ignore */ }
   }
 
@@ -1939,10 +1980,17 @@ function fmt(n) {
       // 旧方式の周回単独の三乗根は legacyChips に残す）
       var cumBefore = 0;
       for (var ci = 0; ci < logArr.length; ci++) cumBefore += (logArr[ci].totalEarned || 0);
-      var chips = Math.max(0, prestigeLevelFor(cumBefore + (tr.lastTotal || 0)) - prestigeLevelFor(cumBefore));
+      var chipsRecon = Math.max(0, prestigeLevelFor(cumBefore + (tr.lastTotal || 0)) - prestigeLevelFor(cumBefore));
+      // v2.3.29: 昇天フローが記録した確定獲得チップ（天界購入前の実測差分）があればそれを正とする
+      var chips = chipsRecon;
+      try {
+        var gainRec = gmGet('ccauto_lastGain', null);
+        if (gainRec && gainRec.run === tr.resets + 1 && typeof gainRec.gain === 'number' && gainRec.gain >= 0) chips = gainRec.gain;
+      } catch (e) { /* ignore */ }
       logArr.push({
         run: tr.resets + 1,
         chips: chips,
+        reconChips: chipsRecon,
         legacyChips: Math.floor(Math.cbrt(Math.max(0, tr.lastTotal || 0) / 1e12)),
         durationSec: Math.max(0, Math.round((now - (tr.startedAt || now)) / 1000)),
         peakCps: Math.round(tr.peakCps || 0),
@@ -1985,6 +2033,21 @@ function fmt(n) {
         }
         try { gmSet('ccauto_chipSamples', []); } catch (e) { /* ignore */ }
         gmSet('ccauto_chipsFix218', 1);
+      }
+    } catch (e) { /* ignore */ }
+    // 一回限りの補正（v2.3.29）: 6周目の chips は旧方式の記録（17,699）だが、
+    // 実際の prestige 増分（57,226 → 75,354 = 18,128）が確認できているため直す
+    try {
+      if (!gmGet('ccauto_gainFix229', 0)) {
+        var fixArr2 = [];
+        try { fixArr2 = gmGet('ccauto_runLog', []); } catch (e) { fixArr2 = []; }
+        if (Array.isArray(fixArr2)) {
+          for (var fi2 = 0; fi2 < fixArr2.length; fi2++) {
+            if (fixArr2[fi2].run === 6 && fixArr2[fi2].chips === 17699) { fixArr2[fi2].chips = 18128; fixArr2[fi2].reconChips = 17699; }
+          }
+          try { gmSet('ccauto_runLog', fixArr2); } catch (e) { /* ignore */ }
+        }
+        gmSet('ccauto_gainFix229', 1);
       }
     } catch (e) { /* ignore */ }
     var runLogArr = [];
@@ -2049,13 +2112,18 @@ function fmt(n) {
     // 黄金スイッチの状態（v2.3.26）: ONだと黄金クッキーが止まるため、検知したら一度だけ知らせる。
     // 自動で戻すのは切り替えに費用がかかる場合があるため見送り（ChatGPT相談に基づく）
     try {
+      // v2.3.29: 判定は所有フラグが正（ChatGPTが公開実装と照合）。
+      // 'Golden switch [off]' を所持している状態が「スイッチON」で、自然出現が止まる。
+      // 名前の存在検索は両定義に当たって誤判定するため使わない
       var gsState = 'unknown';
-      if (typeof G.switchGolden === 'number') gsState = G.switchGolden ? 'on' : 'off';
+      var upOff = G.Upgrades ? G.Upgrades['Golden switch [off]'] : null;
+      var upOn = G.Upgrades ? G.Upgrades['Golden switch [on]'] : null;
+      if (upOff && upOff.bought) gsState = 'on';
+      else if (upOn && upOn.bought) gsState = 'off';
+      else if (typeof G.Has === 'function' && !G.Has('Golden switch')) gsState = 'none';
+      else if (upOff || upOn) gsState = 'off'; // 解放済みでどちらも未所持なら初期状態=OFF
+      else if (typeof G.switchGolden === 'number') gsState = G.switchGolden ? 'on' : 'off';
       else if (typeof G.switchGolden === 'boolean') gsState = G.switchGolden ? 'on' : 'off';
-      // v2.3.28: 実測で補正 — '[on]' のアイテムがある状態でも黄金クッキーは出現していた
-      // （=スイッチはOFF）。表示名は「押すとどうなるか」を表すため、逆に読む。
-      else if (findUpgrade(G, 'Golden switch [on]')) gsState = 'off';
-      else if (findUpgrade(G, 'Golden switch [off]')) gsState = 'on';
       status.goldenSwitch = gsState;
       if (gsState === 'on') {
         if (gmGet('ccauto_gsWarned', 0) !== 1) {
@@ -2087,8 +2155,18 @@ function fmt(n) {
         var ss = spellStats();
         status.grimoire = {
           magic: Math.floor(gmg.magic || 0), magicMax: Math.floor(grimoireMagicMax(gmg)),
-          casts: ss.casts || 0, golden: ss.golden || 0, wrath: ss.wrath || 0, failed: ss.failed || 0
+          casts: ss.casts || 0, success: ss.success || 0, golden: ss.golden || 0, wrath: ss.wrath || 0, failed: ss.failed || 0
         };
+        // 遠隔の切り分け用（v2.3.29）: 直近の見送り理由とAPIの型
+        try {
+          var hf = (G.Objects['Wizard tower'] || {});
+          status.grimoireDebug = {
+            lastSkip: spellState.lastSkip || '', lastCost: spellState.lastCost,
+            getSpellCost: typeof gmg.getSpellCost, castSpell: typeof gmg.castSpell,
+            towerCount: hf.amount || 0, towerLevel: hf.level || 0,
+            gameVersion: (typeof G.version !== 'undefined') ? G.version : null
+          };
+        } catch (e) { /* ignore */ }
       }
     } catch (e) { /* ignore */ }
     try {
@@ -2860,8 +2938,13 @@ function fmt(n) {
     if (chips >= target * 1.5) return true; // 目標を大きく超えたら待ち続けない
     var arr = sampleChips(G, chips);
     var now = Date.now();
-    var old = null;
-    for (var i = 0; i < arr.length; i++) { if (now - arr[i].ts >= 50 * 60000) { old = arr[i]; break; } }
+    // v2.3.29: 「50分以上前で最も古い標本」ではなく「50分前の境界に最も近い標本」を使う
+    // （標本が毎分そろうと約89分前と比較してしまう問題の修正。ChatGPTレビューに基づく）
+    var old = null, bestAge = Infinity;
+    for (var i = 0; i < arr.length; i++) {
+      var age = now - arr[i].ts;
+      if (age >= 50 * 60000 && age < bestAge) { bestAge = age; old = arr[i]; }
+    }
     if (!old) return false; // 観測が貯まるまでは昇天しない
     return (chips - old.chips) < chips * 0.05; // 直近の伸びが5%未満なら鈍化とみなす
   }
@@ -2907,7 +2990,9 @@ function fmt(n) {
     var f = {
       phase: 'backup', run: (G.resets || 0) + 1, startedAt: Date.now(),
       bought: [], failed: [], failedNames: [], skipped: [], idx: 0, planSkip: [],
-      pendingCheck: '', retries: 0, slotKitten: '', chipsAtStart: chips
+      pendingCheck: '', retries: 0, slotKitten: '', chipsAtStart: chips,
+      // v2.3.29: 確定チップの記録用に、開始時点の所持チップとプレステージを残す
+      heavenlyBefore: Math.floor(G.heavenlyChips || 0), prestigeBefore: Math.floor(G.prestige || 0)
     };
     ascendSaveFlow(f);
     log('自動昇天: バックアップの送信確認をしてから昇天します（' + f.run + '周目、チップ ' + chips + ' 個）');
@@ -3055,6 +3140,17 @@ function fmt(n) {
       return;
     }
     if (f.phase === 'buy') {
+      // v2.3.29: 購入フェーズに入った直後（まだ何も買っていない時点）の所持チップから
+      // 「この周回の確定獲得チップ」を記録する。従来の累計からの三乗根再構成は
+      // 最終観測から昇天確定までの稼ぎを取りこぼすため（6周目で429の差が出た）
+      if (typeof f.gainChips !== 'number' && typeof f.heavenlyBefore === 'number') {
+        var gainNow = Math.floor(G.heavenlyChips || 0) - f.heavenlyBefore;
+        if (gainNow >= 0) {
+          f.gainChips = gainNow;
+          try { gmSet('ccauto_lastGain', { run: f.run, gain: gainNow, at: Date.now() }); } catch (e) { /* ignore */ }
+          ascendSaveFlow(f);
+        }
+      }
       if (f.pendingCheck) {
         var upc = findUpgrade(G, f.pendingCheck);
         if (upc && upc.bought) { f.bought.push(f.pendingCheck); f.pendingCheck = ''; }
