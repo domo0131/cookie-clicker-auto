@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.25
+// @version      2.3.26
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.25'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.26'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1862,7 +1862,7 @@ function fmt(n) {
     for (var k in G.Objects) {
       var o = G.Objects[k];
       buildings.push({
-        name: o.name, count: o.amount || 0,
+        name: o.name, count: o.amount || 0, level: (typeof o.level === 'number') ? o.level : 0,
         unitCps: Math.round(o.storedCps || 0), totalCps: Math.round(o.storedTotalCps || 0),
         nextPrice: Math.round(buildingPrice(o) || 0)
       });
@@ -1889,6 +1889,46 @@ function fmt(n) {
     try { status.tabRole = tabState.primary ? 'primary' : 'follower'; } catch (e) { /* ignore */ }
     try { status.ascendEval = effCache ? effCache.data : null; } catch (e) { /* ignore */ }
     try { status.rolledBack = gmGet('ccauto_rollbackSeen', 0) === 1; } catch (e) { /* ignore */ }
+    // 永久スロットの中身（v2.3.26: 遠隔確認用。IDをゲーム内定義と照合して名前で載せる）
+    try {
+      var slotNames = [];
+      var nSl = slotCountOwned(G);
+      for (var sli = 0; sli < nSl; sli++) {
+        var pid2 = G.permanentUpgrades ? G.permanentUpgrades[sli] : 0;
+        var nm2 = null;
+        if (pid2 && G.UpgradesById && G.UpgradesById[pid2]) nm2 = G.UpgradesById[pid2].name || null;
+        slotNames.push(nm2);
+      }
+      status.permanentSlots = slotNames;
+    } catch (e) { /* ignore */ }
+    // 黄金スイッチの状態（v2.3.26）: ONだと黄金クッキーが止まるため、検知したら一度だけ知らせる。
+    // 自動で戻すのは切り替えに費用がかかる場合があるため見送り（ChatGPT相談に基づく）
+    try {
+      var gsState = 'unknown';
+      if (typeof G.switchGolden === 'number') gsState = G.switchGolden ? 'on' : 'off';
+      status.goldenSwitch = gsState;
+      if (gsState === 'on') {
+        if (gmGet('ccauto_gsWarned', 0) !== 1) {
+          gmSet('ccauto_gsWarned', 1);
+          reportError('黄金スイッチがONになっています（黄金クッキーが出現しません）。OFFに戻すことをおすすめします');
+        }
+      } else if (gsState === 'off') {
+        if (gmGet('ccauto_gsWarned', 0) === 1) gmSet('ccauto_gsWarned', 0);
+      }
+    } catch (e) { /* ignore */ }
+    // ドラゴンの状態（v2.3.26: オーラ自動化の前段として遠隔確認用）
+    try {
+      var auraName = function (idx) {
+        try {
+          var a = (G.dragonAuras && typeof idx === 'number') ? G.dragonAuras[idx] : null;
+          return a ? (a.name || null) : null;
+        } catch (e) { return null; }
+      };
+      status.dragon = {
+        level: (typeof G.dragonLevel === 'number') ? G.dragonLevel : null,
+        aura1: auraName(G.dragonAura), aura2: auraName(G.dragonAura2)
+      };
+    } catch (e) { /* ignore */ }
     // 周回（昇天）の記録: 昇天回数・完了した周回の一覧・進行中の周回の状態
     try {
       var runInfo = trackRun(G, status.cps || status.cpsRaw || 0, status.totalEarned || 0);
