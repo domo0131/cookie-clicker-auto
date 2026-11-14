@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.19
+// @version      2.3.20
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -32,11 +32,11 @@
     reportSecret: '', // （v2.2.0で廃止）合言葉はコードに書かず、パネルの「🔑 合言葉設定」から保存する（公開リポジトリに載せないため）
     reportIntervalMs: 60000,  // 状態送信の間隔（ミリ秒）。送信先URLはパネルの「送信先設定」から保存する
     updateCheckMinutes: 10,   // 新しい版が出ていないか GitHub を確認する間隔（分）。新版があれば保存して再読み込みし、取り込む
-    clickBudgetMs: 5         // クリック処理に1回のtickで使う時間の上限（ミリ秒）。ゲーム本体の処理を飢えさせないための制限
+    clickBudgetMs: 15        // クリック処理に1回のtickで使う時間の上限（ミリ秒）。ゲーム本体の処理を飢えさせないための制限（v2.3.20: 5→15に拡大して実測クリック速度の改善を試行。設定250/秒に対し実測約27/秒だった）
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.19'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.20'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
