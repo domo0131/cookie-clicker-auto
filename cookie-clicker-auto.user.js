@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.24
+// @version      2.3.25
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.24'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.25'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1806,6 +1806,9 @@ function fmt(n) {
       });
       if (logArr.length > 50) logArr = logArr.slice(logArr.length - 50);
       try { gmSet('ccauto_runLog', logArr); } catch (e) { /* ignore */ }
+      // 効率判定（v2.3.25）用: 完了した周回の生産カーブを保存する（開始時プレステージは
+      // この周回の開始時点の累計レベル = prestigeLevelFor(cumBefore)）
+      try { archiveRunCurve(tr.resets + 1, prestigeLevelFor(cumBefore)); } catch (e) { /* ignore */ }
       tr = { resets: resets, startedAt: now, peakCps: 0, lastTotal: 0 };
     }
     if (cpsNow > (tr.peakCps || 0)) tr.peakCps = cpsNow;
@@ -1884,6 +1887,7 @@ function fmt(n) {
     status.scriptVersion = SCRIPT_VERSION;
     try { status.autoAscend = (gmGet('ccauto_autoAscend', '1') === '1'); } catch (e) { status.autoAscend = false; }
     try { status.tabRole = tabState.primary ? 'primary' : 'follower'; } catch (e) { /* ignore */ }
+    try { status.ascendEval = effCache ? effCache.data : null; } catch (e) { /* ignore */ }
     try { status.rolledBack = gmGet('ccauto_rollbackSeen', 0) === 1; } catch (e) { /* ignore */ }
     // 周回（昇天）の記録: 昇天回数・完了した周回の一覧・進行中の周回の状態
     try {
@@ -2481,6 +2485,128 @@ function fmt(n) {
       return Math.max(0, prestigeLevelFor(cum + (G.cookiesEarned || 0)) - prestigeLevelFor(cum));
     } catch (e) { return 0; }
   }
+  /* ================= 昇天タイミングの効率判定（v2.3.25・試験運用） =================
+     ChatGPT相談「昇天規則の効率設計」の推奨: 固定の +20% ではなく、「今すぐ昇天」と
+     「15分続けてから昇天」を、今から60分後の累計生産で比べる回収時間ベースの判定。
+     v2.3.25 では実際の昇天は現行ルール（+20%＋ペース）が行い、新判定は影（シャドー）
+     として結果をログと状態送信に残すだけ。判定に必要な「転生後の生産カーブ」は、
+     完了した周回の1分ごとの実測（全期間累計クッキー）から作る */
+  var effCache = null; // {at, data}: 直近の効率判定（状態送信に載せる）
+  function recordCurveSample(G) {
+    try {
+      var resets = G.resets || 0;
+      var cv = null;
+      try { cv = gmGet('ccauto_runCurve', null); } catch (e) { cv = null; }
+      var now = Date.now();
+      if (!cv || cv.resets !== resets || !Array.isArray(cv.samples)) cv = { resets: resets, samples: [] };
+      var last = cv.samples.length ? cv.samples[cv.samples.length - 1] : null;
+      if (last && now - last[0] < 55000) return; // 約1分に1回
+      var cum = 0;
+      try { cum = (G.cookiesReset || 0) + (G.cookiesEarned || 0); } catch (e) { cum = 0; }
+      if (!(cum > 0)) return;
+      cv.samples.push([now, cum]);
+      if (cv.samples.length > 3000) cv.samples = cv.samples.slice(cv.samples.length - 3000);
+      gmSet('ccauto_runCurve', cv);
+    } catch (e) { /* ignore */ }
+  }
+  function archiveRunCurve(completedRun, startPrestige) {
+    try {
+      var cv = gmGet('ccauto_runCurve', null);
+      if (!cv || !Array.isArray(cv.samples) || cv.samples.length < 5) return;
+      if ((cv.resets || 0) !== completedRun - 1) return; // 別周回のカーブは混ぜない
+      var hist = [];
+      try { hist = gmGet('ccauto_curveHist', []); } catch (e) { hist = []; }
+      if (!Array.isArray(hist)) hist = [];
+      hist.push({ run: completedRun, startPrestige: startPrestige, samples: cv.samples });
+      if (hist.length > 3) hist = hist.slice(hist.length - 3);
+      gmSet('ccauto_curveHist', hist);
+    } catch (e) { /* ignore */ }
+  }
+  // 転生後の生産カーブ Y(t分, プレステージS) の推定: 過去の周回の実測カーブ（開始からの
+  // 新規生産）を、プレステージ倍率 (1 + 0.01*S) の比で補正して中央値を取る。
+  // 記録が t 分に届いていない周回は使わない（短い周回の外挿はしない）
+  function estimateY(tMin, S) {
+    var hist = [];
+    try { hist = gmGet('ccauto_curveHist', []); } catch (e) { hist = []; }
+    if (!Array.isArray(hist) || !hist.length) return null;
+    var vals = [];
+    for (var i = 0; i < hist.length; i++) {
+      var h = hist[i];
+      if (!h || !Array.isArray(h.samples) || h.samples.length < 5) continue;
+      var base = h.samples[0][1];
+      var target = h.samples[0][0] + tMin * 60000;
+      var cum = null;
+      for (var j = 0; j < h.samples.length; j++) {
+        if (h.samples[j][0] >= target) { cum = h.samples[j][1]; break; }
+      }
+      if (cum === null) continue;
+      var scale = (1 + 0.01 * S) / (1 + 0.01 * (h.startPrestige || 0));
+      vals.push((cum - base) * scale);
+    }
+    if (!vals.length) return null;
+    vals.sort(function (a, b) { return a - b; });
+    return vals[Math.floor(vals.length / 2)];
+  }
+  // 効率判定本体（影運用）: Y(60, S_now) >= 1.10 * (D15 + Y(45, S_wait)) が
+  // 1分間隔で3回連続したら「今すぐ昇天が有利」。歯止め: 周回45分未満は判定しない、
+  // バフ中は保留する（バフの延長価値は累計増分でしか測れず、外挿が暴れるため）
+  function efficiencyVerdict(G) {
+    var now = Date.now();
+    if (effCache && now - effCache.at < 55000) return effCache.data;
+    var data = { ready: false, why: '', streak: 0 };
+    try {
+      var tr = null;
+      try { tr = gmGet('ccauto_runTrack', null); } catch (e) { tr = null; }
+      var elapsedMin = (tr && tr.startedAt) ? (now - tr.startedAt) / 60000 : 0;
+      data.elapsedMin = Math.round(elapsedMin);
+      if (elapsedMin < 45) { data.why = '周回45分未満'; effCache = { at: now, data: data }; return data; }
+      if (anyBuffActive()) { data.why = 'バフ中'; effCache = { at: now, data: data }; return data; }
+      var cv = null;
+      try { cv = gmGet('ccauto_runCurve', null); } catch (e) { cv = null; }
+      if (!cv || !Array.isArray(cv.samples) || cv.samples.length < 21) { data.why = 'サンプル不足'; effCache = { at: now, data: data }; return data; }
+      var samples = cv.samples;
+      var cumNow = samples[samples.length - 1][1];
+      function ratePerMin(min) {
+        var from = now - min * 60000;
+        var past = null;
+        for (var i = samples.length - 1; i >= 0; i--) { if (samples[i][0] <= from) { past = samples[i]; break; } }
+        if (!past) return null;
+        var span = (samples[samples.length - 1][0] - past[0]) / 60000;
+        if (span < min * 0.6) return null;
+        return (cumNow - past[1]) / span;
+      }
+      var r10 = ratePerMin(10), r20 = ratePerMin(20);
+      if (r10 === null && r20 === null) { data.why = 'レート不明'; effCache = { at: now, data: data }; return data; }
+      var rate = Math.max(r10 || 0, r20 || 0); // 高い方: 一時的な減速での早切りを抑える
+      var D15 = rate * 15;
+      var C = 0;
+      try { C = (G.cookiesReset || 0) + (G.cookiesEarned || 0); } catch (e) { C = cumNow; }
+      var sNow = prestigeLevelFor(C);
+      var sWait = prestigeLevelFor(C + D15);
+      var yNow = estimateY(60, sNow);
+      var y45 = estimateY(45, sWait);
+      data.sNow = sNow; data.sWait = sWait;
+      if (yNow === null || y45 === null) { data.why = 'カーブ不足'; effCache = { at: now, data: data }; return data; }
+      var yWait = D15 + y45;
+      data.yNow = Math.round(yNow); data.yWait = Math.round(yWait);
+      data.ratio = Math.round((yNow / Math.max(1, yWait)) * 1000) / 1000;
+      var raw = yNow >= 1.10 * yWait;
+      var st = null;
+      try { st = gmGet('ccauto_effStreak', null); } catch (e) { st = null; }
+      if (!st || st.resets !== (G.resets || 0)) st = { resets: G.resets || 0, n: 0, logged: 0 };
+      st.n = raw ? (st.n || 0) + 1 : 0;
+      data.streak = st.n;
+      data.ready = st.n >= 3;
+      if (data.ready && !st.logged) {
+        st.logged = 1;
+        log('効率判定（試験）: 今すぐ昇天が有利と判定しました（60分予測: 今すぐ ' + fmt(yNow) + ' / 15分待ち ' + fmt(yWait) + '）');
+      }
+      try { gmSet('ccauto_effStreak', st); } catch (e) { /* ignore */ }
+    } catch (e) { data.why = '判定エラー'; }
+    effCache = { at: now, data: data };
+    return data;
+  }
+
   function chipsThisRun(G) { return pendingChips(G); }
   function ascendTargetFor(G) {
     var run = (G.resets || 0) + 1;
@@ -2651,7 +2777,7 @@ function fmt(n) {
     // 番号で比べると、セーブの巻き戻しでゲームの周回が記録より少なく戻った場合に
     // 「未来の完了記録」が残り続け、再昇天が二度と始まらなくなる（2026-11-14 実発生）
     if (f && f.phase === 'done') f = null;
-    if (!f) { slotHeal(G); ascendMaybeStart(G); return; }
+    if (!f) { slotHeal(G); recordCurveSample(G); efficiencyVerdict(G); ascendMaybeStart(G); return; }
     if (f.phase === 'done') return;
     if (f.phase === 'stuck') {
       // 再読み込みで止まった場合だけ、昇天が「実行されていない」と証明できれば復旧する。
