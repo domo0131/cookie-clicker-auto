@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.30
+// @version      2.3.31
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.30'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.31'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -400,6 +400,19 @@ function fmt(n) {
     catch (e) { return obj.price; }
   }
 
+  // パンテオンの slot は、ゲームのセーブ復元経路（for…in の文字列キーを slotGod に
+  // 渡す）で文字列（"0" 等）になることがある（v2.3.31 実測）。読み取り側でのみ
+  // 正規化し、受け付けるのは -1/0/1/2 の数値かその文字列だけ。それ以外
+  // （null・空文字・真偽値など）は「判定不能」として null を返す
+  // （Number(null) や Number('') が 0 になり、配置済みと誤判定するため）
+  function godSlotNum(g) {
+    if (!g) return null;
+    var s = g.slot;
+    if (typeof s === 'number' && (s === -1 || s === 0 || s === 1 || s === 2)) return s;
+    if (typeof s === 'string' && (s === '-1' || s === '0' || s === '1' || s === '2')) return Number(s);
+    return null;
+  }
+
   function holoboreState() {
     // 'slotted'（配置中）/ 'none'（未配置で確定）/ 'unknown'（判定不能）の3状態。
     // 'none' のときだけ黄金クッキーをクリックしてよい。
@@ -410,8 +423,8 @@ function fmt(n) {
       var tt = W.Game.Objects['Temple'];
       var tmg = tt && tt.minigame;
       if (tmg && tmg.gods) {
-        var asc = tmg.gods['asceticism'];
-        if (asc && typeof asc.slot === 'number') return asc.slot === -1 ? 'none' : 'slotted';
+        var ascS = godSlotNum(tmg.gods['asceticism']);
+        if (ascS !== null) return ascS === -1 ? 'none' : 'slotted';
         // 読めなかった場合は下のフォールバックへ（最終的に unknown 寄りに倒れる）
       }
     } catch (e) { /* fallthrough */ }
@@ -1807,11 +1820,11 @@ function fmt(n) {
     var targets = [{ id: 'labor', slot: 0, label: 'ダイヤ' }, { id: 'mother', slot: 2, label: 'ヒスイ' }];
     var changed = false;
     function tryPlace(god, slot) {
-      if (!god || god.slot === slot) return false;
+      if (!god || godSlotNum(god) === slot) return false; // 配置済み（文字列の "2" 等も含む）なら何もしない
       if (typeof mg.swaps === 'number' && mg.swaps < 1) return false; // 付け替え回数が無い
       var swapsBefore = (typeof mg.swaps === 'number') ? mg.swaps : null;
       try { mg.slotGod(god, slot); } catch (e) { return false; }
-      if (god.slot !== slot) {
+      if (godSlotNum(god) !== slot) {
         try { gmSet('ccauto_pantheonDebug', 'slotGod(' + (god.name || '?') + ',' + slot + ') called but slot=' + god.slot + ' swaps=' + mg.swaps); } catch (e) { /* ignore */ }
         return false;
       }
@@ -1835,7 +1848,7 @@ function fmt(n) {
     try {
       for (var gid in mg.gods) {
         var g2 = mg.gods[gid];
-        if (g2 && g2.slot === 1) {
+        if (g2 && godSlotNum(g2) === 1) {
           if (tryPlace(g2, -1)) { changed = true; log('パンテオン配置: ルビーを空けました（' + (g2.name || gid) + ' を外しました）'); }
         }
       }
@@ -1847,8 +1860,8 @@ function fmt(n) {
     try {
       var m1 = mg.gods['labor'], m2 = mg.gods['mother'];
       var rubyEmpty = true;
-      for (var gid2 in mg.gods) { if (mg.gods[gid2] && mg.gods[gid2].slot === 1) rubyEmpty = false; }
-      if (m1 && m1.slot === 0 && m2 && m2.slot === 2 && rubyEmpty) {
+      for (var gid2 in mg.gods) { if (mg.gods[gid2] && godSlotNum(mg.gods[gid2]) === 1) rubyEmpty = false; }
+      if (godSlotNum(m1) === 0 && godSlotNum(m2) === 2 && rubyEmpty) {
         var rk = 'r' + (G.resets || 0);
         if (gmGet('ccauto_pantheonRun', '') !== rk) {
           gmSet('ccauto_pantheonRun', rk);
@@ -2250,7 +2263,8 @@ function fmt(n) {
         var slots = [null, null, null];
         for (var gid2 in pmg.gods) {
           var gg2 = pmg.gods[gid2];
-          if (gg2 && typeof gg2.slot === 'number' && gg2.slot >= 0 && gg2.slot <= 2) slots[gg2.slot] = gg2.name || null;
+          var gsN = godSlotNum(gg2);
+          if (gsN !== null && gsN >= 0 && gsN <= 2) slots[gsN] = gg2.name || null;
         }
         status.pantheon = slots;
         status.pantheonSwaps = (typeof pmg.swaps === 'number') ? Math.floor(pmg.swaps) : null;
@@ -3419,7 +3433,8 @@ function fmt(n) {
       var parts = [];
       for (var gid in mg.gods) {
         var g = mg.gods[gid];
-        if (g && typeof g.slot === 'number' && g.slot >= 0) parts.push(gid + ':' + g.slot);
+        var psN = godSlotNum(g);
+        if (psN !== null && psN >= 0) parts.push(gid + ':' + psN);
       }
       return parts.sort().join(',');
     } catch (e) { return ''; }
