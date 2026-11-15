@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.42
+// @version      2.3.43
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.42'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.43'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -3048,7 +3048,7 @@ function fmt(n) {
 
   var panel = null;
   // ===== 画面ズーム（v2.3.42、ユーザー要望「開いたとき常に縮小」＋ChatGPTレビュー） =====
-  // 旧来の90%切替を拡張: 値は 0.5/0.67/0.75/0.8/1 のみ。適用先は従来どおり body の style.zoom。
+  // 旧来の90%切替を拡張: 値は 0.5/0.67/0.75/0.8/1 のみ。適用先は html の style.zoom（v2.3.43で body から変更）。
   // 未移行の端末では初回に 0.5 へ移行する（ccauto_zoomV2）。座標クリックは
   // getBoundingClientRect と clientX/Y が同じ座標系なので補正不要（レビュー確認済み）。
   var ZOOM_STEPS = [0.5, 0.67, 0.75, 0.8, 1];
@@ -3067,12 +3067,15 @@ function fmt(n) {
   }
   function applyPageZoom() {
     try {
-      if (!document.body) return;
+      if (!document.body || !document.documentElement) return;
+      // v2.3.43: 適用先を body から html（ルート）へ変更。body 方式では右端のショップ列と
+      // 左下固定のパネルが画面外に押し出された（実機確認）。body 側の指定は必ず外す
+      try { document.body.style.removeProperty('zoom'); } catch (e) { /* ignore */ }
       var z = pageZoom();
       var next = (z >= 1) ? '' : String(z);
-      var prev = document.body.style.zoom || '';
-      document.body.style.zoom = next;
-      var readback = document.body.style.zoom || '';
+      var prev = document.documentElement.style.zoom || '';
+      document.documentElement.style.zoom = next;
+      var readback = document.documentElement.style.zoom || '';
       zoomOk = (next === '' || readback !== '');
       if (prev !== next && zoomOk) {
         // 倍率が変わったときだけ、次フレームで resize を送って描画側の再計算を促す
