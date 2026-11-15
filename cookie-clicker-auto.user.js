@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.37
+// @version      2.3.38
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.37'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.38'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -739,7 +739,26 @@ function fmt(n) {
   // 1つでも合わなければ、このセッションではシミュレーション自体を止める。
   var simDisabled = gmGet('ccauto_simDisabled', 0) === 1; // 一度止めたら再読み込みしても戻さない
   var simFailCount = 0; // 全体系の復元照合の連続失敗数（3回続いたら測定方法を停止する）
-  var upGainCache = {}; // name -> {dcps, dclick, at, ach, cps, bOwned, uOwned}
+  var upGainCache = {}; // name -> {dcps, dclick, at, ach, cps, bOwned, uOwned}（正常に測れた結果だけを入れる。v2.3.38）
+  // v2.3.38（ChatGPTレビュー）: 無効化された測定を増産0としてキャッシュすると、その品が候補から
+  // 落ち続けて買われなくなる。無効結果は理由と次回試行時刻を分けて持ち、通常評価に便乗して測り直す。
+  var upRetry = {}; // name -> {reason, nextAt, ach, bOwned, uOwned, cps}
+  var upWildPrev = {}; // name -> {dcps, dclick, at}（異常値の確認待ち: 次回も同程度なら正当な大幅増産として採用する）
+  var simInvalidCounts = { wild: 0, ach: 0, drift: 0 }; // 送信周期ごとの無効化件数（collectStatus が読み取ってリセット）
+  var simMemoAt = {}; // name|reason -> 最後にメモを出した時刻（同じ品・同じ理由は1時間に1回まで）
+  function memoSimInvalid(name, reason, detail) {
+    if (typeof simInvalidCounts[reason] === 'number') simInvalidCounts[reason]++;
+    var key = name + '|' + reason;
+    var now = Date.now();
+    if (simMemoAt[key] && now - simMemoAt[key] < 3600000) return;
+    simMemoAt[key] = now;
+    log('測定メモ: 全体系の実測を無効にしました（' + name + '、' +
+        (reason === 'wild' ? '異常値' : (reason === 'ach' ? '実績増加' : '派生値のずれ')) +
+        (detail ? '、' + detail : '') + '）');
+  }
+  function setUpRetry(name, reason, now, ach, bOwned, uOwned, cpsNow) {
+    upRetry[name] = { reason: reason, nextAt: now + 60000, ach: ach, bOwned: bOwned, uOwned: uOwned, cps: cpsNow };
+  }
   function simulatedUpgradeGain(up, cpsNow) {
     if (simDisabled) return 0;
     var name = up.name;
@@ -751,6 +770,12 @@ function fmt(n) {
     if (c && c.ach === ach && c.bOwned === bOwned && c.uOwned === uOwned &&
         (now - c.at) < 60000 && c.cps > 0 && Math.abs(cpsNow - c.cps) / c.cps < 0.2) {
       return c.dcps + c.dclick * measuredClickRate();
+    }
+    // 無効化の直後はしばらく測り直さない（状態が変われば早める）。この間は「効果なし」ではなく「未測定」として0を返す
+    var rt = upRetry[name];
+    if (rt && now < rt.nextAt && rt.ach === ach && rt.bOwned === bOwned && rt.uOwned === uOwned &&
+        !(rt.cps > 0 && cpsNow > 0 && Math.abs(cpsNow - rt.cps) / rt.cps >= 0.2)) {
+      return 0;
     }
     var dcps = 0, dclick = 0;
     try {
@@ -793,6 +818,7 @@ function fmt(n) {
           if (up.bought !== origBought ||
               (highest0 !== null && G.cookiesPsRawHighest !== highest0) ||
               G.cookies !== bank0 || achNowG < ach0 ||
+              (G.BuildingsOwned || 0) !== bOwned ||
               (G.UpgradesOwned || 0) !== uOwned0) {
             hardFail = true;
           } else {
@@ -810,6 +836,7 @@ function fmt(n) {
         // 1回では止めず、3回続いたら全体系の測定を停止する（建物側と同じ考え方）
         simFailCount++;
         dcps = 0; dclick = 0;
+        setUpRetry(name, 'hardfail', now, ach, bOwned, uOwned, cpsNow);
         if (simFailCount >= 3) {
           simDisabled = true;
           gmSet('ccauto_simDisabled', 1);
@@ -818,13 +845,36 @@ function fmt(n) {
         } else {
           log('測定メモ: 全体系の復元照合で不一致（' + simFailCount + '回目）。今回の測定だけ無効にしました');
         }
-      } else if (wild || achJump || driftFail) {
-        dcps = 0; dclick = 0;
-        log('測定メモ: 全体系の実測を無効にしました（' + (wild ? '異常値' : (achJump ? '実績増加' : '派生値のずれ')) + '）');
+        return 0;
+      } else if (wild && !achJump && !driftFail) {
+        // 異常値（総生産の2倍超）: 正当な大幅増産（子猫系など）の可能性もあるため、捨てずに確認待ちにする。
+        // 次回の測定でも同程度（3倍以内）で復元も正常なら、正当な増産として採用する（v2.3.38、ChatGPTレビュー）
+        var wp = upWildPrev[name];
+        if (wp && (now - wp.at) < 600000 && wp.dcps > 0 && dcps > 0 &&
+            dcps / wp.dcps >= 1 / 3 && dcps / wp.dcps <= 3) {
+          delete upWildPrev[name];
+          delete upRetry[name];
+          simFailCount = 0;
+          upGainCache[name] = { dcps: dcps, dclick: dclick, at: now, ach: ach, cps: cpsNow, bOwned: bOwned, uOwned: uOwned };
+          return dcps + dclick * measuredClickRate();
+        }
+        upWildPrev[name] = { dcps: dcps, dclick: dclick, at: now };
+        memoSimInvalid(name, 'wild', '増分 ' + fmt(Math.round(dcps)) + ' / 現在 ' + fmt(Math.round(cps0)));
+        setUpRetry(name, 'wild', now, ach, bOwned, uOwned, cpsNow);
+        return 0;
+      } else if (achJump || driftFail || wild) {
+        memoSimInvalid(name, achJump ? 'ach' : 'drift', '');
+        setUpRetry(name, achJump ? 'ach' : 'drift', now, ach, bOwned, uOwned, cpsNow);
+        return 0;
       } else {
         simFailCount = 0;
       }
-    } catch (e) { dcps = 0; dclick = 0; }
+    } catch (e) {
+      setUpRetry(name, 'error', now, ach, bOwned, uOwned, cpsNow);
+      return 0;
+    }
+    // ここに来るのは正常に測れた場合だけ（増産0の確定も含む）。無効化された測定はキャッシュに入れない
+    delete upRetry[name];
     upGainCache[name] = { dcps: dcps, dclick: dclick, at: now, ach: ach, cps: cpsNow, bOwned: bOwned, uOwned: uOwned };
     return dcps + dclick * measuredClickRate();
   }
@@ -1448,6 +1498,97 @@ function fmt(n) {
   // イベント駆動チェーン（v2.3.22）: buyStep は「次の実行までの待ち時間（ミリ秒）」を返す。
   // 購入できるときは検証が閉じ次第すぐ次へ進み、貯金中は買える見込みまでの時間を眠る。
   var buyDelayHint = 1000;
+  // 店頭滞留の少額アップグレード救済（v2.3.38、ChatGPTレビューに基づく案4）。
+  // 実測が無効化され続ける品や、順序比較で後回しにされ続ける品が、価格の割に
+  // 大きな効果を持ったまま残る事故（29周目の Lindworms 等）への最後の受け皿。
+  // 見なし増産で回収順位には混ぜず、条件を満たした品を通常の購入経路で1件だけ買う。
+  var storePresence = {}; // name -> {since, price}（店頭に初めて見えた時刻）
+  var rescueLastAt = 0;
+  var rescueSpend = []; // {at, price}（直近1時間の救済支出）
+  var rescueCount = 0; // 送信周期ごとの救済購入件数（collectStatus が読み取ってリセット）
+  var rescueLastLabel = '';
+  function updateStorePresence() {
+    try {
+      var store = W.Game.UpgradesInStore || [];
+      var seen = {};
+      for (var i = 0; i < store.length; i++) {
+        var up = store[i];
+        if (!up || up.bought) continue;
+        seen[up.name] = true;
+        var price = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice;
+        var p = storePresence[up.name];
+        if (!p) storePresence[up.name] = { since: Date.now(), price: price };
+        else p.price = price;
+      }
+      for (var n in storePresence) if (!seen[n]) delete storePresence[n];
+    } catch (e) { /* ignore */ }
+  }
+  function rescueEligible(up, cpsNow) {
+    if (!up || up.bought) return false;
+    if (isBlockedUpgrade(up)) return false; // 研究・One Mind 等の禁止リストは候補評価と同じ
+    var pool = '';
+    try { pool = up.pool || ''; } catch (e) { pool = ''; }
+    if (pool === 'tech' || pool === 'toggle' || pool === 'prestige' || pool === 'debug') return false;
+    if (up.buildingTie2) return false; // シナジーは候補評価でも対象外
+    var nm = (up.name || '').toLowerCase();
+    if (/egg/.test(nm)) return false;
+    if (GC_BOOSTER_NAMES.indexOf(nm) >= 0) return false; // 専用の見なし評価で候補に入る
+    var tie = null;
+    try { tie = up.buildingTie1 || null; } catch (e) { tie = null; }
+    if (tie) {
+      if (typeof up.tier !== 'number') return false; // ティア（×2）強化だけ
+      if (!((tie.amount || 0) > 0)) return false; // 建物が0軒では効かない
+    } else {
+      if (!isGlobalAdmissible(up)) return false;
+      // 正常に測れて増産ゼロだった品は、割引効果も無い場合だけ「効果なし」として救済しない
+      var c = upGainCache[up.name];
+      if (c && !(c.dcps > 0) && !(c.dclick > 0) && !(discountValue(up, cpsNow) > 0)) return false;
+    }
+    return true;
+  }
+  function tryRescueBuy(ev) {
+    try {
+      if (anyBuffActive()) return false; // バフ中は通常評価が止まるだけなので救済しない
+      var now = Date.now();
+      if (now - rescueLastAt < 60000) return false; // 1分に1件まで
+      var G = W.Game;
+      var bank = G.cookies;
+      var income = totalIncome(ev.cpsNow);
+      if (!(income > 0) || !(bank > 0)) return false;
+      rescueSpend = rescueSpend.filter(function (s) { return now - s.at < 3600000; });
+      var spentSum = 0;
+      for (var si = 0; si < rescueSpend.length; si++) spentSum += rescueSpend[si].price;
+      if (spentSum >= income * 10) return false; // 1時間の救済支出は収入の10秒分まで
+      var store = G.UpgradesInStore || [];
+      for (var i = 0; i < store.length; i++) {
+        var up = store[i];
+        if (!up || up.bought) continue;
+        var pres = storePresence[up.name];
+        if (!pres || now - pres.since < 120000) continue; // 店頭に2分以上残っている
+        if (!rescueEligible(up, ev.cpsNow)) continue;
+        var price = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice;
+        if (!(price > 0) || price > bank) continue;
+        if (price > income) continue; // 収入の1秒分以下
+        if (price > bank * 0.001) continue; // 残高の0.1%以下
+        if (spentSum + price > income * 10) continue;
+        var cand = { kind: 'upgrade', ref: up, label: up.name, price: price, gain: 0, payback: Infinity, noVerify: true };
+        var n = doBuy(cand, true);
+        if (n) {
+          rescueLastAt = now;
+          rescueSpend.push({ at: now, price: price });
+          rescueCount++;
+          rescueLastLabel = up.name;
+          delete storePresence[up.name];
+          evalCache = null; // アップグレード購入後は評価を作り直す（通常購入と同じ）
+          log('購入: ' + up.name + '（' + fmt(price) + '）');
+          log('救済メモ: ' + up.name + ' は店頭に長く残っていた少額品のため購入しました');
+          return true;
+        }
+      }
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
   function buyStep() {
     buyDelayHint = 1000;
     try { buyStepInner(); } catch (e) { /* チェーンを止めない */ }
@@ -1565,6 +1706,7 @@ function fmt(n) {
       }
     }
     if (state.halted) { renderPanel(); return; }
+    updateStorePresence(); // v2.3.38: 店頭滞留の記録（救済購入の判定材料）
     var G = W.Game;
     var boughtCounts = {};
     var boughtTotal = 0;
@@ -1606,6 +1748,8 @@ function fmt(n) {
           // 貯金中でも「実際に次に買う可能性があるもの」を状態に残す（買える候補が無いときは null = 本当に貯金だけ）
           state.actualNext = watchB ? { label: watchB.label, price: Math.round(watchB.price), kind: watchB.kind, mode: 'candidate' } : null;
           if (boughtTotal === 0) { setSaveTarget(top, ev.cpsNow, true); state.goalTarget = ''; state.goalDetail = ''; setGoals(top, null, 1, true, bank, totalIncome(ev.cpsNow)); }
+          // v2.3.38: 貯金で手が空く間、店頭に長く残った少額アップグレードを1件だけ救済購入する
+          if (tryRescueBuy(ev)) { buyDelayHint = CONFIG.buyRestMs; break; }
           // 貯金中は「買える見込みまで」の時間を眠る（上限2秒。下限150ミリ秒）。収入が上振れしても2秒以内に追従できる
           buyDelayHint = (R > 0 && top.price > bank) ? Math.max(150, Math.min(2000, Math.round((top.price - bank) / R * 1000))) : 1000;
           break;
@@ -2502,6 +2646,13 @@ function fmt(n) {
       };
       perf.evalCount = 0; perf.evalMs = 0; perf.evalMaxMs = 0;
       perf.clickMs = 0; perf.clickTicks = 0; perf.longFrames = 0; perf.maxFrameMs = 0;
+    } catch (e) { /* ignore */ }
+    // 全体系実測の無効化件数と救済購入の集計（v2.3.38）: 前回送信からの分を載せてリセットする
+    try {
+      status.simInvalid = { wild: simInvalidCounts.wild, ach: simInvalidCounts.ach, drift: simInvalidCounts.drift };
+      simInvalidCounts.wild = 0; simInvalidCounts.ach = 0; simInvalidCounts.drift = 0;
+      status.rescue = { count: rescueCount, last: rescueLastLabel };
+      rescueCount = 0;
     } catch (e) { /* ignore */ }
     return status;
   }
