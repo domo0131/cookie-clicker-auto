@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.36
+// @version      2.3.37
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.36'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.37'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -374,6 +374,15 @@
 }
 
 function fmt(n) {
+    if (n >= 1e42) return (n / 1e42).toFixed(3) + ' TrD';
+    if (n >= 1e39) return (n / 1e39).toFixed(3) + ' DoD';
+    if (n >= 1e36) return (n / 1e36).toFixed(3) + ' UnD';
+    if (n >= 1e33) return (n / 1e33).toFixed(3) + ' Dc';
+    if (n >= 1e30) return (n / 1e30).toFixed(3) + ' No';
+    if (n >= 1e27) return (n / 1e27).toFixed(3) + ' Oc';
+    if (n >= 1e24) return (n / 1e24).toFixed(3) + ' Sp';
+    if (n >= 1e21) return (n / 1e21).toFixed(3) + ' Sx';
+    if (n >= 1e18) return (n / 1e18).toFixed(3) + ' Qi';
     if (n >= 1e15) return (n / 1e15).toFixed(3) + ' Qa';
     if (n >= 1e12) return (n / 1e12).toFixed(3) + ' T';
     if (n >= 1e9) return (n / 1e9).toFixed(3) + ' B';
