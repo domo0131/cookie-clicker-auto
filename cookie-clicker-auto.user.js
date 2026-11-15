@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.46
+// @version      2.3.47
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.46'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.47'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1530,6 +1530,184 @@ function fmt(n) {
     return 'off';
   }
   // 戻り値: 'active' = 再生がこの回を担当（購入した/待っている）/ 'off' = 通常購入へ
+  // ===== 周回開始スプリント（v2.3.47、ユーザー指示＋ChatGPTレビュー） =====
+  // 周回の最初だけ、通常の回収順位付けより先に (1) 少額アップグレードの掃引、
+  // (2) 建物の100軒（届かなければ次の節目）までの括り買い を行い、1個ずつの
+  // 購入が量産されるロスをなくす。歯止め: 収入 R（バフなしCpS＋クリック収入）に
+  // 対し、掃引は1件 R×1・1掃引合計 R×5 まで、チャンクは総額 R×5 まで。
+  // 高額品・測れない品は通常評価に渡す。窓は開始から3分（延長なし）。
+  // 試験中（ccauto_sprintMode = '1'、既定）は再生を使わず「スプリント→通常購入」。
+  var sprintStateCache = null;
+  function sprintLoadState(runNo, anchorAt) {
+    if (sprintStateCache && sprintStateCache.run === runNo) return sprintStateCache;
+    var st = null;
+    try { st = gmGet('ccauto_sprint', null); } catch (e) { st = null; }
+    if (!st || st.run !== runNo || typeof st.startedAt !== 'number') {
+      st = { run: runNo, startedAt: anchorAt || Date.now(), done: '', sweepSpent: 0, bought: 0 };
+      try { gmSet('ccauto_sprint', st); } catch (e) { /* ignore */ }
+    }
+    sprintStateCache = st;
+    return st;
+  }
+  function sprintSaveState(st) {
+    sprintStateCache = st;
+    try { gmSet('ccauto_sprint', st); } catch (e) { /* ignore */ }
+  }
+  function sprintExactSum(obj, n) {
+    try {
+      if (typeof obj.getSumPrice === 'function') {
+        var sp = obj.getSumPrice(n);
+        if (sp > 0 && isFinite(sp)) return sp;
+      }
+    } catch (e) { /* ignore */ }
+    return null; // 正確な総額が取れないチャンクは見送る（レビュー指示）
+  }
+  function sprintPickUpgrade(G, R, st) {
+    var store = [];
+    try { store = G.UpgradesInStore || []; } catch (e) { store = []; }
+    var best = null;
+    for (var i = 0; i < store.length; i++) {
+      var up = store[i];
+      if (!up || up.bought) continue;
+      if (st['skipU_' + up.name]) continue;
+      if (isBlockedUpgrade(up)) continue;
+      var pool = '';
+      try { pool = up.pool || ''; } catch (e) { pool = ''; }
+      if (pool === 'toggle') continue;
+      if (up.buildingTie2) continue;
+      if (!up.buildingTie1 && !isGlobalAdmissible(up)) continue;
+      var price = 0;
+      try { price = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice; } catch (e) { price = up.basePrice || 0; }
+      if (!(price >= 0) || price > R) continue; // 1件あたり収入1秒分まで
+      if (st.sweepSpent + price > R * 5) continue; // 掃引1回の合計は収入5秒分まで
+      if (!best || price < best.price) best = { ref: up, name: up.name, price: price };
+    }
+    return best;
+  }
+  function sprintPickChunk(G, R, bank, st) {
+    var cpsNow = baseCps();
+    var rawSum = 0;
+    try { for (var rk in G.Objects) { rawSum += G.Objects[rk].storedTotalCps || 0; } } catch (e) { rawSum = 0; }
+    var flatCps = 0;
+    try { if (G.Has && (G.Has('egg') || G.Has('\"egg\"'))) flatCps = 9; } catch (e) { flatCps = 0; }
+    var gMult = (rawSum + flatCps) > 0 ? cpsNow / (rawSum + flatCps) : 1;
+    if (!(gMult > 0) || !isFinite(gMult)) gMult = 1;
+    var clickBoost = 1;
+    try { clickBoost = clickBoostNow(measuredClickRate()); } catch (e) { clickBoost = 1; }
+    var bestAff = null, bestWait = null;
+    for (var key in G.Objects) {
+      var obj = G.Objects[key];
+      if (!obj || obj.locked) continue;
+      var amt = obj.amount || 0;
+      if (amt >= 100) continue;
+      if (st['skipB_' + obj.name]) continue;
+      var cand = null;
+      var q100 = 100 - amt;
+      var p100 = sprintExactSum(obj, q100);
+      if (p100 != null && p100 <= R * 5) {
+        cand = { qty: q100, price: p100, target: 100 };
+      } else {
+        var T = amt < 25 ? 25 : (amt < 50 ? 50 : 100);
+        var qT = T - amt;
+        if (qT > 0 && qT < q100) {
+          var pT = sprintExactSum(obj, qT);
+          if (pT != null && pT <= R * 5) cand = { qty: qT, price: pT, target: T };
+        }
+      }
+      if (!cand) continue;
+      var unit = 0;
+      try { unit = buildingGainOf(obj, cpsNow, gMult, clickBoost); } catch (e) { unit = 0; }
+      if (!(unit > 0)) continue;
+      var gain = unit * cand.qty;
+      // 節目到達で既存分も倍化する分を概算に足す（順位付け専用の近似）
+      gain += (obj.storedTotalCps || 0) * gMult * clickBoost;
+      cand.ref = obj;
+      cand.gain = gain;
+      cand.payback = cand.price / gain;
+      cand.label = obj.name + '（' + (amt + cand.qty) + '軒目）';
+      if (cand.price <= bank) {
+        if (!bestAff || cand.payback < bestAff.payback) bestAff = cand;
+      } else {
+        cand.eta = R > 0 ? (cand.price - bank) / R : Infinity;
+        if (!bestWait || cand.payback < bestWait.payback) bestWait = cand;
+      }
+    }
+    return { aff: bestAff, wait: bestWait };
+  }
+  function sprintAllHundred(G) {
+    try {
+      for (var key in G.Objects) {
+        var o = G.Objects[key];
+        if (o && !o.locked && (o.amount || 0) < 100) return false;
+      }
+    } catch (e) { return false; }
+    return true;
+  }
+  function sprintStep() {
+    if (gmGet('ccauto_sprintMode', '1') !== '1') return 'off';
+    var G = W.Game; if (!G) return 'off';
+    if (!tabState.primary) return 'off';
+    if (ascendBusy()) return 'off';
+    var runNo = (G.resets || 0) + 1;
+    var rc = null;
+    try { rc = gmGet('ccauto_runCurrent', null); } catch (e) { rc = null; }
+    var anchorAt = (rc && rc.run === runNo && typeof rc.startedAt === 'number') ? rc.startedAt : null;
+    var st = sprintLoadState(runNo, anchorAt);
+    if (st.done) { state.sprintInfo = null; return 'off'; }
+    var now = Date.now();
+    if (now - st.startedAt > 180000) {
+      st.done = 'timeout'; sprintSaveState(st);
+      log('序盤スプリントを終了しました（開始から3分）。通常の購入に切り替えます');
+      state.sprintInfo = null;
+      return 'off';
+    }
+    if (buffSignature() !== '') return 'off'; // バフ中は一時停止（窓の期限は延長しない）
+    if (G.recalculateGains) { buyDelayHint = 150; return 'active'; }
+    var R = 0;
+    try { R = totalIncome(baseCps()); } catch (e) { R = 0; }
+    if (!(R > 0)) return 'off'; // 収入の物差しが立つまでは通常購入に任せる
+    var bank = G.cookies || 0;
+    // (1) 少額アップグレードの掃引（1サイクル1件）
+    var sweep = sprintPickUpgrade(G, R, st);
+    if (sweep) {
+      state.sprintInfo = { phase: 'sweep', label: sweep.name };
+      state.actualNext = { label: sweep.name, price: Math.round(sweep.price), kind: 'upgrade', mode: 'candidate' };
+      var gotU = doBuy({ kind: 'upgrade', ref: sweep.ref, label: sweep.name, price: sweep.price, gain: 0, payback: Infinity, noVerify: true, __src: 'sprint' });
+      if (gotU) { st.sweepSpent += sweep.price; st.bought++; }
+      else st['skipU_' + sweep.name] = 1;
+      sprintSaveState(st);
+      evalCache = null;
+      return 'active';
+    }
+    // (2) 建物チャンク
+    var pick = sprintPickChunk(G, R, bank, st);
+    if (pick.aff) {
+      var c = pick.aff;
+      state.sprintInfo = { phase: 'chunk', label: c.label };
+      state.actualNext = { label: c.label, price: Math.round(c.price), kind: 'building', mode: 'candidate' };
+      var gotQ = doBuy({ kind: 'building', ref: c.ref, label: c.label, price: c.price, gain: c.gain, payback: c.payback, qty: c.qty, __src: 'sprint' });
+      st.sweepSpent = 0; // 建物を買ったら掃引予算は次の掃引へ
+      if (gotQ) st.bought++;
+      else st['skipB_' + c.ref.name] = 1;
+      sprintSaveState(st);
+      return 'active';
+    }
+    if (pick.wait && pick.wait.eta <= 10) {
+      // 上限内のチャンクが数秒で買えるなら、その分だけ待つ（長い貯金はしない）
+      state.sprintInfo = { phase: 'wait', label: pick.wait.label };
+      state.actualNext = { label: pick.wait.label, price: Math.round(pick.wait.price), kind: 'building', mode: 'candidate' };
+      buyDelayHint = Math.max(100, Math.min(1000, Math.round(pick.wait.eta * 1000)));
+      return 'active';
+    }
+    // (3) 有効な手がない。立ち上げ直後（30秒未満・実績なし）は通常購入に譲り、後で入る
+    if (!st.bought && now - st.startedAt < 30000) return 'off';
+    st.done = sprintAllHundred(G) ? 'all100' : 'nomove';
+    sprintSaveState(st);
+    log('序盤スプリントを終了しました（' + (st.done === 'all100' ? '全建物100軒に到達' : '上限内で買えるものが無くなりました') + '）。通常の購入に切り替えます');
+    state.sprintInfo = null;
+    return 'off';
+  }
+
   function replayStep() {
     var G = W.Game; if (!G) return 'off';
     var runNo = (G.resets || 0) + 1;
@@ -1960,8 +2138,10 @@ function fmt(n) {
     // v2.3.39: ショップ購入OFFの間は、購入も候補評価も店頭滞留の観測も止める
     // （前回購入の検証は上の処理で通常どおり済ませる。クリック等は別の経路で継続）
     if (gmGet('ccauto_shopBuy', '1') !== '1') { requestRender(); return; }
-    // v2.3.41: 前回の購入リストの再生（検証なし・最速）。再生が担当する間は通常購入に入らない
-    if (replayStep() === 'active') { requestRender(); return; }
+    // v2.3.47: 周回開始スプリント（試験中は再生より優先し、その周回は再生を使わない）
+    if (gmGet('ccauto_sprintMode', '1') === '1') {
+      if (sprintStep() === 'active') { requestRender(); return; }
+    } else if (replayStep() === 'active') { requestRender(); return; }
     updateStorePresence(); // v2.3.38: 店頭滞留の記録（救済購入の判定材料）
     var G = W.Game;
     var boughtCounts = {};
@@ -2657,6 +2837,16 @@ function fmt(n) {
     if (cpsNow > (tr.peakCps || 0)) tr.peakCps = cpsNow;
     if (totalEarned > 0) tr.lastTotal = totalEarned;
     try { gmSet('ccauto_runTrack', tr); } catch (e) { /* ignore */ }
+    // 序盤判定の起点（v2.3.47で新設）: v2.3.40 の sprintActive() が読む ccauto_runCurrent は
+    // 書き込み箇所が無く、評価間隔の短縮が一度も発動していなかった（ChatGPTレビューで発覚）。
+    // 周回追跡が確定した開始時刻を、判定側が読むキーへここで必ず書き出す
+    try {
+      var rcW = null;
+      try { rcW = gmGet('ccauto_runCurrent', null); } catch (e) { rcW = null; }
+      if (!rcW || rcW.run !== tr.resets + 1 || rcW.startedAt !== tr.startedAt) {
+        gmSet('ccauto_runCurrent', { run: tr.resets + 1, startedAt: tr.startedAt });
+      }
+    } catch (e) { /* ignore */ }
     // 一回限りの補正（v2.3.18）: 過去の周回記録の chips を実績（累計レベルの増加分）へ直す。
     // 旧値は legacyChips に残す。合計がゲームの prestige と小さくずれる場合は最後の周回で吸収する
     try {
@@ -2875,7 +3065,9 @@ function fmt(n) {
           last: (state.lastInterim && topD && state.lastInterim.goal === topD.label) ? state.lastInterim : null
         },
         // 購入リスト再生の進み具合（v2.3.41）
-        replay: state.replayInfo ? { idx: state.replayInfo.idx, total: state.replayInfo.total, label: state.replayInfo.label } : null
+        replay: state.replayInfo ? { idx: state.replayInfo.idx, total: state.replayInfo.total, label: state.replayInfo.label } : null,
+        // 周回開始スプリントの状態（v2.3.47）
+        sprint: state.sprintInfo ? { phase: state.sprintInfo.phase, label: state.sprintInfo.label } : null
       };
     } catch (e) { /* ignore */ }
     // 画面ズームの診断（v2.3.44）: 主要要素の矩形とビューポート寸法を載せ、
@@ -4235,12 +4427,16 @@ function fmt(n) {
           gmSet('ccauto_heavenLog', hl);
         } catch (e) { /* ignore */ }
         log('自動昇天が完了しました（' + f.run + '周目終了、チップ ' + f.chipsAtStart + ' 個、購入 ' + f.bought.length + ' 件、見送り ' + f.skipped.length + ' 件）');
+        // 序盤判定の起点（v2.3.47）: 転生が確定したこの時刻が最も正確な周回開始
+        try { gmSet('ccauto_runCurrent', { run: f.run + 1, startedAt: Date.now() }); } catch (e) { /* ignore */ }
         // 購入リストの学習（v2.3.41）: 正常に終わった周回の購入実績を次回の再生リストに採用する。
         // 巻き戻しのあった周回・記録が欠けた周回は採用せず、救済購入の品はリストから外す
         try {
           var candRec = null;
           try { candRec = gmGet('ccauto_runRecord', null); } catch (eL) { candRec = null; }
-          if (candRec && candRec.run === f.run && !candRec.overflow && !candRec.tainted && Array.isArray(candRec.events) && candRec.events.length >= 20) {
+          // v2.3.47: 周回開始スプリントの試験中は、再生リストの自動採用を止める
+          // （成績の悪い試験周回を引き継がないため。記録自体は継続する）
+          if (gmGet('ccauto_sprintMode', '1') !== '1' && candRec && candRec.run === f.run && !candRec.overflow && !candRec.tainted && Array.isArray(candRec.events) && candRec.events.length >= 20) {
             var evsL = [];
             for (var li = 0; li < candRec.events.length; li++) { if (candRec.events[li].src !== 'rescue') evsL.push(candRec.events[li]); }
             if (evsL.length >= 20) {
