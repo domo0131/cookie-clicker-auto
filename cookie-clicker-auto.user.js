@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.40
+// @version      2.3.41
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.40'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.41'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1383,6 +1383,7 @@ function fmt(n) {
             log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
             // v2.3.30: 購入ごとの即時送信はやめ、1分周期の送信に集約する（タブの負荷軽減）
           }
+          recordEvent({ k: 'b', name: cand.ref.name, qty: gotQty, target: (cand.ref.amount || 0), src: (cand.__src || 'normal') });
           return gotQty;
         }
       } else {
@@ -1398,6 +1399,7 @@ function fmt(n) {
             log('購入: ' + cand.label + ' / ' + fmt(cand.price) + ' / 回収約' + Math.round(cand.payback / 360) / 10 + '時間');
             // v2.3.30: 購入ごとの即時送信はやめ、1分周期の送信に集約する（タブの負荷軽減）
           }
+          recordEvent({ k: 'u', name: cand.ref.name, src: (cand.__src || 'normal') });
           return 1;
         }
       }
@@ -1462,6 +1464,190 @@ function fmt(n) {
   }
 
   // 第1目標（効率1位）と第2目標（その間に実際に買うもの。貯金中は null）の表示状態をそろえる
+  // ===== 購入リストの再生と学習（v2.3.41、ユーザー提案＋ChatGPTレビュー） =====
+  // 各周回で実際に買ったものを doBuy の成功地点で記録し、自動昇天の完了時に
+  // 「正常に終わった周回の実績」を次回の再生リストとして採用する（学習）。
+  // 次の周回では序盤にそのリストを検証なしで最速再生し、使い切るか詰まったら
+  // 通常の評価＋検証つき購入に戻る。救済購入で買った品は採用から外す。
+  var runRecord = null; // {run, startedAt, events:[], dirty, overflow, tainted}
+  var replayMem = { waitIdx: -1, waitSince: 0, retryIdx: -1, retries: 0 };
+  var replayStateCache = null;
+  var replayListCache = undefined; // undefined = 未読込
+  function recordEnsure() {
+    var G = W.Game; if (!G) return null;
+    var runNo = (G.resets || 0) + 1;
+    if (runRecord && runRecord.run === runNo) return runRecord;
+    var saved = null;
+    try { saved = gmGet('ccauto_runRecord', null); } catch (e) { saved = null; }
+    if (saved && saved.run === runNo && Array.isArray(saved.events)) {
+      runRecord = saved;
+    } else {
+      runRecord = { run: runNo, startedAt: Date.now(), events: [], dirty: 0, overflow: false, tainted: false };
+    }
+    return runRecord;
+  }
+  function recordFlush() {
+    if (!runRecord) return;
+    try { gmSet('ccauto_runRecord', runRecord); runRecord.dirty = 0; } catch (e) { /* ignore */ }
+  }
+  function recordEvent(ev) {
+    try {
+      var rec = recordEnsure(); if (!rec) return;
+      if (rec.overflow) return;
+      if (rec.events.length >= 1000) { rec.overflow = true; recordFlush(); return; }
+      ev.t = Math.max(0, Math.round((Date.now() - (rec.startedAt || Date.now())) / 1000));
+      rec.events.push(ev);
+      rec.dirty = (rec.dirty || 0) + 1;
+      if (rec.dirty >= 10) recordFlush();
+    } catch (e) { /* ignore */ }
+  }
+  function replayGetList() {
+    if (replayListCache !== undefined) return replayListCache;
+    var l = null;
+    try { l = gmGet('ccauto_replayList', null); } catch (e) { l = null; }
+    replayListCache = l;
+    return l;
+  }
+  function replayLoadState(runNo) {
+    if (replayStateCache && replayStateCache.run === runNo) return replayStateCache;
+    var st = null;
+    try { st = gmGet('ccauto_replayState', null); } catch (e) { st = null; }
+    if (!st || st.run !== runNo || typeof st.idx !== 'number') st = { run: runNo, idx: 0, done: false, abort: '' };
+    replayStateCache = st;
+    return st;
+  }
+  function replaySaveState(st) {
+    replayStateCache = st;
+    try { gmSet('ccauto_replayState', st); } catch (e) { /* ignore */ }
+  }
+  function replayAbort(st, reason) {
+    st.done = true; st.abort = reason;
+    replaySaveState(st);
+    state.replayInfo = null;
+    log('購入リストの再生を終了します（' + reason + '）。通常の購入に切り替えます');
+    try { traceEvent('replay-abort'); } catch (e) { /* ignore */ }
+    evalCache = null;
+    return 'off';
+  }
+  // 戻り値: 'active' = 再生がこの回を担当（購入した/待っている）/ 'off' = 通常購入へ
+  function replayStep() {
+    var G = W.Game; if (!G) return 'off';
+    var runNo = (G.resets || 0) + 1;
+    var list = replayGetList();
+    if (!list || !Array.isArray(list.events) || !list.events.length) { state.replayInfo = null; return 'off'; }
+    var st = replayLoadState(runNo);
+    if (st.done) { state.replayInfo = null; return 'off'; }
+    var events = list.events;
+    // 既に満たした項目を飛ばす（再読み込みをまたいでも冪等に再開できる）
+    var idxBefore = st.idx;
+    while (st.idx < events.length) {
+      var e0 = events[st.idx];
+      if (e0.k === 'u') {
+        var u0 = findUpgrade(G, e0.name);
+        if (u0 && u0.bought) { st.idx++; continue; }
+      } else if (e0.k === 'b') {
+        var b0 = G.Objects[e0.name];
+        if (b0 && (b0.amount || 0) >= (e0.target || 0)) { st.idx++; continue; }
+      }
+      break;
+    }
+    if (st.idx !== idxBefore) replaySaveState(st);
+    if (st.idx >= events.length) {
+      st.done = true; replaySaveState(st);
+      state.replayInfo = null;
+      log('購入リストの再生が完了しました（' + events.length + ' 件）。通常の購入に切り替えます');
+      try { traceEvent('replay-done'); } catch (e) { /* ignore */ }
+      evalCache = null;
+      return 'off';
+    }
+    var ev = events[st.idx];
+    var bank = G.cookies || 0;
+    var price = 0;
+    if (ev.k === 'b') {
+      var b = G.Objects[ev.name];
+      if (!b) return replayAbort(st, '記録の建物が見つかりません: ' + ev.name);
+      var need = (ev.target || 0) - (b.amount || 0);
+      if (need <= 0) { st.idx++; replaySaveState(st); return 'active'; }
+      var labelB = ev.name + ' ×' + Math.min(need, 100);
+      state.replayInfo = { idx: st.idx, total: events.length, label: labelB };
+      state.actualNext = { label: labelB, price: Math.round(buildingPrice(b)), kind: 'building', mode: 'candidate' };
+      if (G.recalculateGains) { buyDelayHint = 150; return 'active'; }
+      var unit = buildingPrice(b);
+      var capQ = Math.min(need, 100);
+      var lo = 0, hi = capQ;
+      while (lo < hi) { var mid = Math.ceil((lo + hi) / 2); if (sumPriceFor(b, unit, mid) <= bank) lo = mid; else hi = mid - 1; }
+      if (lo > 0) {
+        replayMem.waitIdx = -1; replayMem.waitSince = 0;
+        var bankB = bank, amtB = b.amount || 0;
+        var got = buyBuildingUnits(b, lo);
+        if (got > 0) {
+          recordEvent({ k: 'b', name: ev.name, qty: got, target: (b.amount || 0), src: 'replay' });
+          log('購入: ' + ev.name + (got > 1 ? ' ×' + got : '') + '（' + fmt(Math.max(0, bankB - (G.cookies || 0))) + '）');
+          if ((b.amount || 0) >= (ev.target || 0)) { st.idx++; replaySaveState(st); }
+          buyDelayHint = CONFIG.buyRestMs;
+          return 'active';
+        }
+        if ((b.amount || 0) !== amtB || (G.cookies || 0) !== bankB) return replayAbort(st, '購入の反映が想定と違いました: ' + ev.name);
+        if (replayMem.retryIdx === st.idx && replayMem.retries >= 1) return replayAbort(st, '購入が反映されませんでした: ' + ev.name);
+        replayMem.retryIdx = st.idx; replayMem.retries++;
+        buyDelayHint = 300;
+        return 'active';
+      }
+      price = sumPriceFor(b, unit, 1); // 1軒分でも買える見込みで待つか判断する
+    } else {
+      var up = findUpgrade(G, ev.name);
+      if (!up) return replayAbort(st, '記録のアップグレードが見つかりません: ' + ev.name);
+      if (up.bought) { st.idx++; replaySaveState(st); return 'active'; }
+      // 禁止・対象外チェック（記録は通常購入の実績なので通常は該当しない。二重の安全弁）
+      var pool = '';
+      try { pool = up.pool || ''; } catch (e) { pool = ''; }
+      if (isBlockedUpgrade(up) || pool === 'toggle' || pool === 'tech' || pool === 'prestige' || pool === 'debug' || up.buildingTie2 || /egg/i.test(up.name || '')) {
+        return replayAbort(st, '対象外の品が記録にありました: ' + ev.name);
+      }
+      try { price = up.getPrice(); } catch (e) { price = 0; }
+      state.replayInfo = { idx: st.idx, total: events.length, label: ev.name };
+      state.actualNext = { label: ev.name, price: Math.round(price || 0), kind: 'upgrade', mode: 'candidate' };
+      if (G.recalculateGains) { buyDelayHint = 150; return 'active'; }
+      var inStore = false;
+      try { var sa = G.UpgradesInStore || []; for (var si = 0; si < sa.length; si++) if (sa[si] === up) { inStore = true; break; } } catch (e) { inStore = false; }
+      if (inStore && price > 0 && bank >= price) {
+        replayMem.waitIdx = -1; replayMem.waitSince = 0;
+        var bankU = bank;
+        try { up.buy(); } catch (e) { /* ignore */ }
+        if (up.bought) {
+          recordEvent({ k: 'u', name: ev.name, src: 'replay' });
+          log('購入: ' + ev.name + '（' + fmt(Math.max(0, bankU - (G.cookies || 0))) + '）');
+          st.idx++; replaySaveState(st);
+          buyDelayHint = CONFIG.buyRestMs;
+          return 'active';
+        }
+        if ((G.cookies || 0) !== bankU) return replayAbort(st, '購入の反映が想定と違いました: ' + ev.name);
+        if (replayMem.retryIdx === st.idx && replayMem.retries >= 1) return replayAbort(st, '購入が反映されませんでした: ' + ev.name);
+        replayMem.retryIdx = st.idx; replayMem.retries++;
+        buyDelayHint = 300;
+        return 'active';
+      }
+      if (!inStore) {
+        // 店頭に無い: 短時間だけ待ち、それでも出なければ通常購入へ
+        if (replayMem.waitIdx !== st.idx) { replayMem.waitIdx = st.idx; replayMem.waitSince = Date.now(); }
+        if (Date.now() - replayMem.waitSince > 2000) return replayAbort(st, '店頭に出ていない品がありました: ' + ev.name);
+        buyDelayHint = 250;
+        return 'active';
+      }
+      if (!(price > 0)) return replayAbort(st, '価格が読めませんでした: ' + ev.name);
+    }
+    // 資金待ち（建物・アップグレード共通）: 見込み時間が短いときだけ待つ
+    if (replayMem.waitIdx !== st.idx) { replayMem.waitIdx = st.idx; replayMem.waitSince = Date.now(); }
+    var income = 0;
+    try { income = totalIncome(baseCps()); } catch (e) { income = 0; }
+    var eta = (income > 0 && isFinite(income)) ? (price - bank) / income : Infinity;
+    if (!(eta <= 10) || Date.now() - replayMem.waitSince > 60000) {
+      return replayAbort(st, '買える見込みが遠い品がありました: ' + ev.name);
+    }
+    buyDelayHint = 250;
+    return 'active';
+  }
+
   function setGoals(top, second, active, saving, bank, inc) {
     state.goal1 = goalInfo(top, bank, inc);
     state.goal2 = goalInfo(second, bank, inc);
@@ -1636,7 +1822,7 @@ function fmt(n) {
         if (price > income) continue; // 収入の1秒分以下
         if (price > bank * 0.001) continue; // 残高の0.1%以下
         if (spentSum + price > income * 10) continue;
-        var cand = { kind: 'upgrade', ref: up, label: up.name, price: price, gain: 0, payback: Infinity, noVerify: true };
+        var cand = { kind: 'upgrade', ref: up, label: up.name, price: price, gain: 0, payback: Infinity, noVerify: true, __src: 'rescue' };
         var n = doBuy(cand, true);
         if (n) {
           rescueLastAt = now;
@@ -1774,6 +1960,8 @@ function fmt(n) {
     // v2.3.39: ショップ購入OFFの間は、購入も候補評価も店頭滞留の観測も止める
     // （前回購入の検証は上の処理で通常どおり済ませる。クリック等は別の経路で継続）
     if (gmGet('ccauto_shopBuy', '1') !== '1') { requestRender(); return; }
+    // v2.3.41: 前回の購入リストの再生（検証なし・最速）。再生が担当する間は通常購入に入らない
+    if (replayStep() === 'active') { requestRender(); return; }
     updateStorePresence(); // v2.3.38: 店頭滞留の記録（救済購入の判定材料）
     var G = W.Game;
     var boughtCounts = {};
@@ -2352,6 +2540,7 @@ function fmt(n) {
       var origStart = dropped ? Math.max(0, (dropped.endedAt || now) - (dropped.durationSec || 0) * 1000) : now;
       tr = { resets: resets, startedAt: origStart || now, peakCps: Math.max(dropped ? (dropped.peakCps || 0) : 0, cpsNow || 0), lastTotal: totalEarned || 0 };
       try { gmSet('ccauto_runTrack', tr); } catch (e) { /* ignore */ }
+      if (runRecord) runRecord.tainted = true; // v2.3.41: 巻き戻しのあった周回の購入記録は学習に採用しない
       reportError('セーブの巻き戻しを検知し、周回記録を実態に合わせて修正しました（購入は継続します）');
     }
     // チェックポイント（v2.3.23）: 到達済みの (resets, prestige) の最大値を保持し、それを下回る
@@ -2684,7 +2873,9 @@ function fmt(n) {
           // 購入OFFの間は「次に買う」を送らない（買わないものを次と表示しないため。v2.3.39）
           next: (gmGet('ccauto_shopBuy', '1') !== '1') ? null : (state.actualNext || null),
           last: (state.lastInterim && topD && state.lastInterim.goal === topD.label) ? state.lastInterim : null
-        }
+        },
+        // 購入リスト再生の進み具合（v2.3.41）
+        replay: state.replayInfo ? { idx: state.replayInfo.idx, total: state.replayInfo.total, label: state.replayInfo.label } : null
       };
     } catch (e) { /* ignore */ }
     // エラー記録（新しい順・最大10件）を状態に載せる。Muse側のチェッカーが新しいものをチャットへ報告する
@@ -3098,6 +3289,9 @@ function fmt(n) {
     if (statsEl) statsEl.textContent = statsTxt;
     var esc = function (s) { return ('' + s).replace(/</g, '&lt;'); };
     var nxHtml = '';
+    if (state.replayInfo) {
+      nxHtml += '▶ 前回の購入リストを再生中（' + (state.replayInfo.idx + 1) + '/' + state.replayInfo.total + '）: 次は ' + esc(state.replayInfo.label) + '<br>';
+    }
     var shopOff = gmGet('ccauto_shopBuy', '1') !== '1';
     if (shopOff) {
       // v2.3.39: 購入OFFの間は目標・次に買うものを出さず、停止中とだけ表示する（古い計画が最新に見えないように）
@@ -3607,6 +3801,7 @@ function fmt(n) {
       return;
     }
     gmSet('ccauto_pendingSave', sc);
+    recordFlush(); // v2.3.41: 昇天開始前にこの周回の購入記録を保存しきる（学習の採用材料）
     var f = {
       phase: 'backup', run: (G.resets || 0) + 1, startedAt: Date.now(),
       bought: [], failed: [], failedNames: [], skipped: [], idx: 0, planSkip: [],
@@ -3911,6 +4106,26 @@ function fmt(n) {
           gmSet('ccauto_heavenLog', hl);
         } catch (e) { /* ignore */ }
         log('自動昇天が完了しました（' + f.run + '周目終了、チップ ' + f.chipsAtStart + ' 個、購入 ' + f.bought.length + ' 件、見送り ' + f.skipped.length + ' 件）');
+        // 購入リストの学習（v2.3.41）: 正常に終わった周回の購入実績を次回の再生リストに採用する。
+        // 巻き戻しのあった周回・記録が欠けた周回は採用せず、救済購入の品はリストから外す
+        try {
+          var candRec = null;
+          try { candRec = gmGet('ccauto_runRecord', null); } catch (eL) { candRec = null; }
+          if (candRec && candRec.run === f.run && !candRec.overflow && !candRec.tainted && Array.isArray(candRec.events) && candRec.events.length >= 20) {
+            var evsL = [];
+            for (var li = 0; li < candRec.events.length; li++) { if (candRec.events[li].src !== 'rescue') evsL.push(candRec.events[li]); }
+            if (evsL.length >= 20) {
+              var prevList = null;
+              try { prevList = gmGet('ccauto_replayList', null); } catch (eL2) { prevList = null; }
+              if (prevList) { try { gmSet('ccauto_replayGood', prevList); } catch (eL3) { /* ignore */ } }
+              var newList = { run: f.run, at: Date.now(), events: evsL };
+              gmSet('ccauto_replayList', newList);
+              replayListCache = newList;
+              log('購入リストを学習しました（' + f.run + '周目の実績 ' + evsL.length + ' 件を次回の再生に使います）');
+              try { traceEvent('replay-learn'); } catch (eL4) { /* ignore */ }
+            }
+          }
+        } catch (eL5) { /* ignore */ }
         if (f.failed.length) reportError('自動昇天: 買えなかったものがあります: ' + f.failed.join('、'));
         if (slotCountOwned(G) > 0 && !(G.permanentUpgrades && G.permanentUpgrades[0])) {
           reportError('自動昇天: 永久スロットが空のまま終わりました');
