@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.39
+// @version      2.3.40
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.39'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.40'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -129,6 +129,17 @@
     if (c.nonce && c.nonce !== TAB_NONCE) return true;
     return false;
   }
+  // 経路の切り分け用の足跡（v2.3.40、ChatGPTレビュー）: 起動・選挙・再読み込み・転生の
+  // 出来事を GM に最大24件残し、状態送信に載せる。転生後の無操作時間の内訳を特定するため
+  function traceEvent(ev) {
+    try {
+      var tr = gmGet('ccauto_trace', []);
+      if (!Array.isArray(tr)) tr = [];
+      tr.push({ at: Date.now(), ev: ev });
+      if (tr.length > 24) tr = tr.slice(tr.length - 24);
+      gmSet('ccauto_trace', tr);
+    } catch (e) { /* ignore */ }
+  }
   function tabSetRole(primary) {
     var changed = (tabState.primary !== primary) || !tabState.decided;
     // 主タブになった時刻（巻き戻し検知の保留窓の起点。v2.3.35）
@@ -147,6 +158,7 @@
     } catch (e) { /* ignore */ }
     if (changed) {
       log(primary ? 'このタブが主タブとして動作します' : '別のタブが主タブのため、このタブは待機します（二重タブ防止）');
+      traceEvent(primary ? 'primary' : 'follower');
       try { renderPanel(); } catch (e) { /* ignore */ }
     }
     if (primary) primaryRecovery();
@@ -168,6 +180,7 @@
     try { last = gmGet('ccauto_handoverReloadAt', 0) || 0; } catch (e) { last = 0; }
     if (Date.now() - last < 30000) { tabSetRole(false); return; } // 間隔ガード中は従タブのまま（書き込みは許可しない）
     try { gmSet('ccauto_handover', { id: TAB_ID, at: Date.now() }); gmSet('ccauto_handoverReloadAt', Date.now()); } catch (e) { /* ignore */ }
+    traceEvent('handover-reload');
     log('主タブを引き継ぐため、最新セーブを読み直します（再読み込み）');
     setTimeout(function () { try { location.reload(); } catch (e) { /* ignore */ } }, 300);
   }
@@ -1326,6 +1339,13 @@ function fmt(n) {
     try { prodBefore = readProduction(); } catch (e) { /* ignore */ }
     var cpsBefore = prodBefore ? prodBefore.cps : 0;
     var clickBefore = prodBefore ? prodBefore.click : 0;
+    // 検証の物差し（実績・バフ・パンテオンの署名）も購入前に揃える（v2.3.40、ChatGPTレビュー）。
+    // 購入後に取ると、購入自体が起こした実績解禁などを「変化なし」として扱ってしまい、
+    // 検証の切り分け（条件変化ならSKIP）が働かない
+    var achBeforeBuy = null, buffsBeforeBuy = null, pantheonBeforeBuy = null;
+    try { achBeforeBuy = achievementsWon(); } catch (e) { /* ignore */ }
+    try { buffsBeforeBuy = buffSignature(); } catch (e) { /* ignore */ }
+    try { pantheonBeforeBuy = pantheonSignature(); } catch (e) { /* ignore */ }
     var writeVerify = !cand.noVerify; // 効果を再計算で検証できない購入（ゴールデンクッキー系）は検証を記録しない
     try {
       if (cand.kind === 'building') {
@@ -1356,7 +1376,7 @@ function fmt(n) {
                 pvGain = (cand.gain || 0) * gotQty;
               }
             }
-            state.pendingVerify = { at: Date.now(), label: pvLabel, kind: cand.kind, gain: pvGain, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: pvPredCps, predClick: pvPredClick, pantheon: pantheonSignature(), partial: pvPartial };
+            state.pendingVerify = { at: Date.now(), label: pvLabel, kind: cand.kind, gain: pvGain, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achBeforeBuy, buffs: buffsBeforeBuy, rateAtBuy: preRate, predCps: pvPredCps, predClick: pvPredClick, pantheon: pantheonBeforeBuy, partial: pvPartial };
             gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
           }
           if (!quiet) {
@@ -1371,7 +1391,7 @@ function fmt(n) {
           if (cand.kind === 'upgrade') discTel.upSpend += cand.price || 0; else discTel.bSpend += cand.price || 0; // 割引系の評価用に支出を記録する
           upGainCache = {}; bGainCache = {}; // 購入が入ったら効果測定のキャッシュは捨て直す
           if (writeVerify) {
-            state.pendingVerify = { at: Date.now(), label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achievementsWon(), buffs: buffSignature(), rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null, pantheon: pantheonSignature(), partial: false };
+            state.pendingVerify = { at: Date.now(), label: cand.label, kind: cand.kind, gain: cand.gain || 0, cpsBefore: cpsBefore, clickBefore: clickBefore, achBefore: achBeforeBuy, buffs: buffsBeforeBuy, rateAtBuy: preRate, predCps: preParts ? preParts.cps : null, predClick: preParts ? preParts.click : null, pantheon: pantheonBeforeBuy, partial: false };
             gmSet('ccauto_pendingVerify', state.pendingVerify); // 再読み込みで検証を飛ばさないよう永続化
           }
           if (!quiet) {
@@ -1391,11 +1411,18 @@ function fmt(n) {
 
   // 実際にゲームへ登録されたクリック速度の実測（直近30秒のクリック数の伸びから算出）
   var clickSamples = [];
+  var clickResetsSeen = -1;
   function sampleClicks() {
     try {
       if (!gameReady()) return;
       var now = Date.now();
-      clickSamples.push([now, W.Game.cookieClicks || 0]);
+      // 転生をまたいだ標本は切り捨てる（同じ文書で転生するとクリック数が0に戻り、実測が壊れる。v2.3.40、ChatGPTレビュー）
+      var rsNow = W.Game.resets || 0;
+      var ckNow = W.Game.cookieClicks || 0;
+      if (clickResetsSeen !== -1 && rsNow !== clickResetsSeen) clickSamples = [];
+      clickResetsSeen = rsNow;
+      if (clickSamples.length && ckNow < clickSamples[clickSamples.length - 1][1]) clickSamples = [];
+      clickSamples.push([now, ckNow]);
       while (clickSamples.length > 2 && now - clickSamples[0][0] > 30000) clickSamples.shift();
       try { sampleGcIncome(); } catch (e2) { /* ignore */ }
       try { sampleSpend(); } catch (e3) { /* ignore */ }
@@ -1482,14 +1509,45 @@ function fmt(n) {
     try { storeN = G.UpgradesInStore ? G.UpgradesInStore.length : -1; } catch (e) { /* ignore */ }
     return buffSignature() + '|' + achievementsWon() + '|' + storeN;
   }
+  // 序盤スプリント（v2.3.40、ChatGPTレビュー）: 立て直しの間だけ全面評価の最小間隔を
+  // 2秒→1秒に縮める。検証は1件ずつのまま変えない。条件を1つでも欠いたら通常間隔に戻る。
+  // 起点は ccauto_runCurrent.startedAt（主タブとして立て直しを始めた時刻）で、
+  // ページの再読み込みでは作り直さない（runCurrent は GM に残る）。
+  var SPRINT_EVAL_MS = 1000;
+  var SPRINT_WINDOW_MS = 180000; // 初期値（実測で調整する）
+  function sprintActive() {
+    try {
+      if (!tabState.primary) return false;
+      if (typeof document !== 'undefined' && document.visibilityState && document.visibilityState !== 'visible') return false;
+      if (gmGet('ccauto_shopBuy', '1') !== '1') return false;
+      if (buffSignature() !== '') return false;
+      if (state.goalSaving) return false;
+      var rc = null;
+      try { rc = gmGet('ccauto_runCurrent', null); } catch (e) { rc = null; }
+      if (!rc || typeof rc.startedAt !== 'number' || typeof rc.run !== 'number') return false;
+      var G = W.Game;
+      if (!G || (G.resets || 0) !== rc.run - 1) return false; // 周回がずれていたら対象外
+      var now = Date.now();
+      if (now - rc.startedAt < 0 || now - rc.startedAt > SPRINT_WINDOW_MS) return false;
+      // 第1候補が「素のCpSの2秒分」以下の間だけ（前回評価の先頭で判定。セットは総額が読みにくいので対象外）
+      if (evalCache && evalCache.ev && evalCache.ev.list && evalCache.ev.list.length) {
+        var top = evalCache.ev.list[0];
+        if (!top || top.kind === 'set') return false;
+        var bc = baseCps();
+        if (!(bc > 0) || !(top.price <= 2 * bc)) return false;
+      }
+      return true;
+    } catch (e) { return false; }
+  }
   function getEvaluation() {
     var now = Date.now();
     if (evalCache && (now - evalCache.at) < 30000 && evalCache.sig === evalSignature()) {
       evalWaitMs = 0;
       return evalCache.ev;
     }
-    if (lastEvalAt && (now - lastEvalAt) < CONFIG.evalIntervalMs) {
-      evalWaitMs = CONFIG.evalIntervalMs - (now - lastEvalAt);
+    var intervalMs = sprintActive() ? SPRINT_EVAL_MS : CONFIG.evalIntervalMs;
+    if (lastEvalAt && (now - lastEvalAt) < intervalMs) {
+      evalWaitMs = intervalMs - (now - lastEvalAt);
       return null; // 全面評価の間隔がまだ空いていない。今回は買わずに待つ
     }
     lastEvalAt = now;
@@ -2498,6 +2556,7 @@ function fmt(n) {
     status.scriptVersion = SCRIPT_VERSION;
     try { status.autoAscend = (gmGet('ccauto_autoAscend', '1') === '1'); } catch (e) { status.autoAscend = false; }
     try { status.shopBuy = (gmGet('ccauto_shopBuy', '1') === '1'); } catch (e) { status.shopBuy = true; }
+    try { status.trace = gmGet('ccauto_trace', []); } catch (e) { /* ignore */ }
     try { status.tabRole = tabState.primary ? 'primary' : 'follower'; } catch (e) { /* ignore */ }
     try { status.tabCode = TAB_ID.slice(-4); status.tabs = tabListForPayload(); } catch (e) { /* ignore */ }
     try { status.heavenLog = gmGet('ccauto_heavenLog', []); } catch (e) { /* ignore */ }
@@ -3168,6 +3227,7 @@ function fmt(n) {
           try { gmSet('ccauto_preReloadSave', W.Game.WriteSave(1)); } catch (e2) { /* ignore */ } // 念のため直前のセーブを控える
           try { W.Game.WriteSave(); } catch (e5) { /* ignore */ } // 実保存（書き込みガードが所有者を照合する）
           try { reportStep(); } catch (e3) { /* ignore */ }
+          traceEvent('reload-update');
           try { location.reload(); } catch (e4) { /* ignore */ }
         }, 3000);
       },
@@ -3827,10 +3887,12 @@ function fmt(n) {
     if (f.phase === 'reincarnate') {
       if (!f.reinCalled) {
         f.reinCalled = 1; f.reinAt = Date.now(); f.resetsBefore = G.resets || 0; ascendSaveFlow(f);
+        traceEvent('reincarnate-call');
         try { G.Reincarnate(1); } catch (e) { ascendStuck(f, '転生の呼び出しでエラー: ' + e); }
         return;
       }
       if ((G.resets || 0) > (f.resetsBefore || 0) && G.OnAscend === 0) {
+        traceEvent('reincarnate-ok');
         f.phase = 'done'; f.completedAt = Date.now(); ascendSaveFlow(f);
         try { gmSet('ccauto_ascendAttempts_' + f.run, 0); } catch (e) { /* ignore */ }
         try { gmSet('ccauto_ascendLast', { at: f.completedAt, run: f.run, chips: f.chipsAtStart, bought: f.bought, failed: f.failed, skipped: f.skipped, slot: f.slotKitten }); } catch (e) { /* ignore */ }
@@ -3932,6 +3994,10 @@ function fmt(n) {
     buildPanel();
     renderPanel();
     // 二重タブ防止（v2.3.23）: 主タブの選挙・維持と、ゲーム保存の遮断ガードの設置
+    try {
+      var bc = tabClaimRead();
+      traceEvent('boot:' + TAB_ID.slice(-4) + ':' + (!bc ? 'noclaim' : (bc.id === TAB_ID ? 'ownclaim' : 'foreignclaim')));
+    } catch (e) { /* ignore */ }
     tabElect();
     setInterval(tabHeartbeat, 5000);
     installSaveGuard();
@@ -4007,6 +4073,7 @@ function fmt(n) {
     rec.count++; rec.at = Date.now();
     try { gmSet('ccauto_loadReload', JSON.stringify(rec)); } catch (e) { /* ignore */ }
     try { log('ゲームの読み込みが進まないため再読み込みします（待機 ' + Math.round(waitMs / 1000) + ' 秒超え、' + rec.count + ' 回目）'); } catch (e) { /* ignore */ }
+    traceEvent('reload-watchdog');
     try { location.reload(); } catch (e) { /* ignore */ }
   }
   setInterval(loadWatchdog, 5000);
