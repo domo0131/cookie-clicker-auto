@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.44
+// @version      2.3.45
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.44'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.45'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -2892,7 +2892,7 @@ function fmt(n) {
         iw: W.innerWidth, ih: W.innerHeight,
         cw: document.documentElement ? document.documentElement.clientWidth : 0,
         vv: vv ? [Math.round(vv.width), Math.round(vv.height), Math.round(vv.offsetLeft), Math.round(vv.offsetTop), Math.round(vv.scale * 100) / 100] : null,
-        zoom: document.documentElement ? (document.documentElement.style.zoom || '') : '',
+        zoom: document.documentElement ? (document.documentElement.style.zoom || '') : '', comp: zoomComp,
         game: rectOf('game'), left: rectOf('sectionLeft'), mid: rectOf('sectionMiddle'), right: rectOf('sectionRight'), store: rectOf('store'), panel: rectOf('ccauto-panel')
       };
     } catch (e) { /* ignore */ }
@@ -3099,8 +3099,68 @@ function fmt(n) {
         // 倍率が変わったときだけ、次フレームで resize を送って描画側の再計算を促す
         try { requestAnimationFrame(function () { try { W.dispatchEvent(new W.Event('resize')); } catch (e) { /* ignore */ } }); } catch (e) { /* ignore */ }
       }
+      applyZoomCompensation(true);
     } catch (e) { /* ignore */ }
   }
+
+  // ===== ブラウザ倍率の補正（v2.3.45、ChatGPTレビュー） =====
+  // 実測で判明: Firefox 側の表示倍率（visualViewport.scale）が 1.16 に固定され、
+  // レイアウトの右と下 約14% が見える範囲の外に出ていた（再読み込み・開き直し・
+  // ダブルタップでも戻らない）。ページ側に倍率を戻す API は無いので、body に
+  // 逆倍率の transform を掛けて相殺する。補正値は起動時・全画面切替時にだけ決め、
+  // 以後は固定する（ユーザーのピンチ操作を追いかけて相殺し続けない）。
+  // 軽い再確認（vv resize / 15秒間隔）は「解除」と「未決定時の初回適用」だけを行う。
+  var zoomComp = 1; // 現在の補正倍率（1 = 補正なし）
+  var zoomCompDecided = false;
+  function applyZoomCompensation(full) {
+    try {
+      var vv = W.visualViewport;
+      if (!vv || !document.body || !document.documentElement) return;
+      var s = vv.scale || 1;
+      if (s <= 1.01) {
+        if (zoomComp !== 1) {
+          document.body.style.transform = '';
+          document.body.style.transformOrigin = '';
+          zoomComp = 1;
+          if (typeof logAdd === 'function') logAdd('ブラウザの表示倍率が戻ったため、画面の補正を解除しました');
+        }
+        zoomCompDecided = false;
+        return;
+      }
+      if (Math.abs(vv.offsetLeft || 0) > 2 || Math.abs(vv.offsetTop || 0) > 2) return; // パン中は決めない
+      if (!full && zoomCompDecided) return;
+      // 補正前の寸法で必要倍率を測る（transform を一時的に外して測り、戻す）
+      var prevT = document.body.style.transform || '';
+      if (prevT) document.body.style.transform = '';
+      var cw = document.documentElement.clientWidth || W.innerWidth || 0;
+      var ch = document.documentElement.clientHeight || W.innerHeight || 0;
+      if (prevT) document.body.style.transform = prevT;
+      if (!cw || !ch) return;
+      var f = Math.min(vv.width / cw, vv.height / ch, 1) * 0.995; // わずかに余裕を持たせる
+      zoomCompDecided = true;
+      if (f >= 0.999) {
+        if (zoomComp !== 1) { document.body.style.transform = ''; document.body.style.transformOrigin = ''; zoomComp = 1; }
+        return;
+      }
+      if (!(f > 0.5)) return; // 異常な値は補正しない
+      if (Math.abs(f - zoomComp) < 0.005 && prevT) return;
+      zoomComp = f;
+      document.body.style.transformOrigin = '0 0';
+      document.body.style.transform = 'scale(' + f + ')';
+      if (typeof logAdd === 'function') logAdd('ブラウザの表示倍率 ' + Math.round(s * 100) + '% で画面が切れるため、全体を ' + Math.round(f * 100) + '% に補正しました');
+    } catch (e) { /* ignore */ }
+  }
+  try { document.addEventListener('fullscreenchange', function () { applyZoomCompensation(true); }); } catch (e) { /* ignore */ }
+  try {
+    if (W.visualViewport) {
+      var zoomCompVvTimer = null;
+      W.visualViewport.addEventListener('resize', function () {
+        if (zoomCompVvTimer) clearTimeout(zoomCompVvTimer);
+        zoomCompVvTimer = setTimeout(function () { applyZoomCompensation(false); }, 800);
+      });
+    }
+  } catch (e) { /* ignore */ }
+  try { setInterval(function () { applyZoomCompensation(false); }, 15000); } catch (e) { /* ignore */ }
 
   function buildPanel() {
     if (panel) return;
