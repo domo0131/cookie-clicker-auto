@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.41
+// @version      2.3.42
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.41'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.42'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -3047,6 +3047,40 @@ function fmt(n) {
   /* ---------------- パネル表示 ---------------- */
 
   var panel = null;
+  // ===== 画面ズーム（v2.3.42、ユーザー要望「開いたとき常に縮小」＋ChatGPTレビュー） =====
+  // 旧来の90%切替を拡張: 値は 0.5/0.67/0.75/0.8/1 のみ。適用先は従来どおり body の style.zoom。
+  // 未移行の端末では初回に 0.5 へ移行する（ccauto_zoomV2）。座標クリックは
+  // getBoundingClientRect と clientX/Y が同じ座標系なので補正不要（レビュー確認済み）。
+  var ZOOM_STEPS = [0.5, 0.67, 0.75, 0.8, 1];
+  var zoomOk = null; // null=未確認 / true=適用できた / false=非対応
+  function pageZoom() {
+    try {
+      if (gmGet('ccauto_zoomV2', '') !== '1') {
+        gmSet('ccauto_zoom', '0.5');
+        gmSet('ccauto_zoomV2', '1');
+        return 0.5;
+      }
+      var v = parseFloat(gmGet('ccauto_zoom', '0.5'));
+      for (var i = 0; i < ZOOM_STEPS.length; i++) if (Math.abs(ZOOM_STEPS[i] - v) < 0.001) return ZOOM_STEPS[i];
+      return 0.5;
+    } catch (e) { return 0.5; }
+  }
+  function applyPageZoom() {
+    try {
+      if (!document.body) return;
+      var z = pageZoom();
+      var next = (z >= 1) ? '' : String(z);
+      var prev = document.body.style.zoom || '';
+      document.body.style.zoom = next;
+      var readback = document.body.style.zoom || '';
+      zoomOk = (next === '' || readback !== '');
+      if (prev !== next && zoomOk) {
+        // 倍率が変わったときだけ、次フレームで resize を送って描画側の再計算を促す
+        try { requestAnimationFrame(function () { try { W.dispatchEvent(new W.Event('resize')); } catch (e) { /* ignore */ } }); } catch (e) { /* ignore */ }
+      }
+    } catch (e) { /* ignore */ }
+  }
+
   function buildPanel() {
     if (panel) return;
     panel = document.createElement('div');
@@ -3138,10 +3172,15 @@ function fmt(n) {
       renderPanel();
     });
     document.getElementById('ccauto-zoom').addEventListener('click', function () {
-      var z = (gmGet('ccauto_zoom', '') === '0.9') ? '' : '0.9';
-      gmSet('ccauto_zoom', z);
-      try { document.body.style.zoom = z; } catch (e) { /* ignore */ }
-      log(z ? '画面を90%に縮小しました' : '画面の縮小を解除しました');
+      if (zoomOk === false) { log('この端末では画面の縮小に対応していません'); return; }
+      var cur = pageZoom();
+      var idx = 0;
+      for (var i = 0; i < ZOOM_STEPS.length; i++) if (Math.abs(ZOOM_STEPS[i] - cur) < 0.001) idx = i;
+      var nextZ = ZOOM_STEPS[(idx + 1) % ZOOM_STEPS.length];
+      gmSet('ccauto_zoom', String(nextZ));
+      gmSet('ccauto_zoomV2', '1');
+      applyPageZoom();
+      log('画面の表示を ' + Math.round(nextZ * 100) + '% にしました');
       renderPanel();
     });
     document.getElementById('ccauto-expand').addEventListener('click', function () {
@@ -3196,7 +3235,7 @@ function fmt(n) {
       renderPanel();
     });
     document.getElementById('ccauto-test').addEventListener('click', function () { reportTest(); });
-    try { document.body.style.zoom = gmGet('ccauto_zoom', ''); } catch (e) { /* ignore */ }
+    applyPageZoom(); // v2.3.42: 保存済みの縮小率を復元（初期値は50%）
   }
 
   var wakeLockObj = null;
@@ -3360,6 +3399,8 @@ function fmt(n) {
     if (asEl) {
       asEl.textContent = '🚀 自動昇天:' + (gmGet('ccauto_autoAscend', '1') === '1' ? 'ON' : 'OFF') + (ascendBusy() ? '（昇天中）' : '');
     }
+    var zmEl = document.getElementById('ccauto-zoom');
+    if (zmEl) zmEl.textContent = (zoomOk === false) ? '🔍 縮小非対応' : '🔍 表示:' + Math.round(pageZoom() * 100) + '%';
     lg.innerHTML = state.logs.slice(0, 12).map(function (s) {
       return s.replace(/</g, '&lt;');
     }).join('<br>');
@@ -4295,6 +4336,8 @@ function fmt(n) {
 
   // セーブ書き込みガードは boot の完了を待たず、ゲームが見えた時点ですぐに設置する（v2.3.32）
   var guardEarlyTimer = setInterval(function () { if (installSaveGuard()) clearInterval(guardEarlyTimer); }, 250);
+
+  applyPageZoom(); // v2.3.42: 起動直後（boot の3秒待ちの前）に縮小を適用する
 
   if (document.readyState === 'complete' || document.readyState === 'interactive') {
     setTimeout(boot, 3000);
