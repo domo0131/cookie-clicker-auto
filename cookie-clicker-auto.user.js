@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.38
+// @version      2.3.39
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.38'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.39'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1087,6 +1087,10 @@ function fmt(n) {
       var up = store[i];
       if (!up || up.bought) continue;
       if (isBlockedUpgrade(up)) continue;
+      // スイッチ類（pool 'toggle'）は全経路で自動購入の対象外（v2.3.39、仕様として明示。ChatGPTレビュー）
+      var poolChk = '';
+      try { poolChk = up.pool || ''; } catch (e) { poolChk = ''; }
+      if (poolChk === 'toggle') continue;
       var tie = up.buildingTie1 || null;
       if (up.buildingTie2) continue; // シナジーは計算式が別（所有数比例）なので、過大評価を避けて対象外
       if (!tie) {
@@ -1277,6 +1281,9 @@ function fmt(n) {
   }
 
   function doBuy(cand, quiet) {
+    // v2.3.39: ショップ購入OFFの間は、どの呼び出し経路からも買わない（実行側の二重の門。
+    // 昇天フローの天上購入は doBuy を使わないため、この門では止まらない）
+    if (gmGet('ccauto_shopBuy', '1') !== '1') return false;
     var G = W.Game;
     var bankBefore = G.cookies;
     // 購入後検証の物差しを固定するため、購入時点の予測内訳（全体系のみ）とクリック実測速度を控える。
@@ -1706,6 +1713,9 @@ function fmt(n) {
       }
     }
     if (state.halted) { renderPanel(); return; }
+    // v2.3.39: ショップ購入OFFの間は、購入も候補評価も店頭滞留の観測も止める
+    // （前回購入の検証は上の処理で通常どおり済ませる。クリック等は別の経路で継続）
+    if (gmGet('ccauto_shopBuy', '1') !== '1') { requestRender(); return; }
     updateStorePresence(); // v2.3.38: 店頭滞留の記録（救済購入の判定材料）
     var G = W.Game;
     var boughtCounts = {};
@@ -2487,6 +2497,7 @@ function fmt(n) {
     };
     status.scriptVersion = SCRIPT_VERSION;
     try { status.autoAscend = (gmGet('ccauto_autoAscend', '1') === '1'); } catch (e) { status.autoAscend = false; }
+    try { status.shopBuy = (gmGet('ccauto_shopBuy', '1') === '1'); } catch (e) { status.shopBuy = true; }
     try { status.tabRole = tabState.primary ? 'primary' : 'follower'; } catch (e) { /* ignore */ }
     try { status.tabCode = TAB_ID.slice(-4); status.tabs = tabListForPayload(); } catch (e) { /* ignore */ }
     try { status.heavenLog = gmGet('ccauto_heavenLog', []); } catch (e) { /* ignore */ }
@@ -2611,7 +2622,8 @@ function fmt(n) {
         goal2: state.goal2 || null,
         // 実際に次に買うもの（next）と、目標までの間に実際に買った直近のもの（last。目標が変わっていたら null）
         actual: {
-          next: state.actualNext || null,
+          // 購入OFFの間は「次に買う」を送らない（買わないものを次と表示しないため。v2.3.39）
+          next: (gmGet('ccauto_shopBuy', '1') !== '1') ? null : (state.actualNext || null),
           last: (state.lastInterim && topD && state.lastInterim.goal === topD.label) ? state.lastInterim : null
         }
       };
@@ -2806,6 +2818,10 @@ function fmt(n) {
       '<button id="ccauto-backup" style="margin-right:4px;">💾 バックアップ</button>' +
       '<button id="ccauto-rate">👆 速度</button>' +
       '</div>' +
+      '<div style="margin-top:4px;">' +
+      '<button id="ccauto-shopbuy" style="margin-right:4px;">🛒 購入:ON</button>' +
+      '<button id="ccauto-ascend">🚀 自動昇天:ON</button>' +
+      '</div>' +
       '<div style="margin-top:4px;">👆速度 ' +
       '<button class="ccauto-rp" data-rate="0" style="margin-right:2px;padding:2px 5px;">止</button>' +
       '<button class="ccauto-rp" data-rate="2" style="margin-right:2px;padding:2px 5px;">2</button>' +
@@ -2838,6 +2854,26 @@ function fmt(n) {
       saveState(); log('モードを ' + state.mode + ' にしました'); renderPanel();
     });
     document.getElementById('ccauto-backup').addEventListener('click', function () { exportSave(true); });
+    // v2.3.39: ショップ購入と自動昇天の ON/OFF（主タブでのみ変更可。保存は読み戻して確認する）
+    document.getElementById('ccauto-shopbuy').addEventListener('click', function () {
+      if (!tabState.primary) { log('設定の変更は主タブでのみできます'); return; }
+      var next = (gmGet('ccauto_shopBuy', '1') === '1') ? '0' : '1';
+      gmSet('ccauto_shopBuy', next);
+      if (gmGet('ccauto_shopBuy', '1') !== next) { log('購入設定の保存に失敗しました'); renderPanel(); return; }
+      storePresence = {}; // 店頭滞留は数え直し（再開直後に救済購入が即発火しないように）
+      evalCache = null;    // 再開後は最新状態で評価し直す
+      log(next === '1' ? 'ショップ購入をONにしました' : 'ショップ購入をOFFにしました（クリック・黄金クッキー・送信は継続します）');
+      renderPanel();
+    });
+    document.getElementById('ccauto-ascend').addEventListener('click', function () {
+      if (!tabState.primary) { log('設定の変更は主タブでのみできます'); return; }
+      var next = (gmGet('ccauto_autoAscend', '1') === '1') ? '0' : '1';
+      gmSet('ccauto_autoAscend', next);
+      if (gmGet('ccauto_autoAscend', '1') !== next) { log('昇天設定の保存に失敗しました'); renderPanel(); return; }
+      if (next === '0' && ascendBusy()) log('自動昇天をOFFにしました。進行中の昇天は続行します');
+      else log(next === '1' ? '自動昇天をONにしました' : '自動昇天をOFFにしました（次回の開始から）');
+      renderPanel();
+    });
     document.getElementById('ccauto-rate').addEventListener('click', function () {
       var cur = clickRate();
       var u = window.prompt('大クッキーの自動クリック速度を入力してください（回/秒、0で停止、最大250。重くなったら下げてください）', cur);
@@ -2996,14 +3032,18 @@ function fmt(n) {
       statsTxt = 'ゲーム読み込み待ち';
     }
     var rep = !gmGet('ccauto_reportUrl', '') ? ' / 送信先未設定' : (!reportSecret() ? ' / 合言葉未設定' : (state.lastReport ? ' / 送信 ' + state.lastReport : ''));
-    st.textContent = runLabel + '（' + modeLabel + '）' + rep;
+    st.textContent = runLabel + '（' + modeLabel + '）' + (gmGet('ccauto_shopBuy', '1') !== '1' ? ' / 購入OFF' : '') + rep;
     st.style.color = state.running ? '#b6f09c' : '#ffb27d';
     st.style.fontWeight = 'bold';
     var statsEl = document.getElementById('ccauto-stats');
     if (statsEl) statsEl.textContent = statsTxt;
     var esc = function (s) { return ('' + s).replace(/</g, '&lt;'); };
     var nxHtml = '';
-    if (state.goal1) {
+    var shopOff = gmGet('ccauto_shopBuy', '1') !== '1';
+    if (shopOff) {
+      // v2.3.39: 購入OFFの間は目標・次に買うものを出さず、停止中とだけ表示する（古い計画が最新に見えないように）
+      nxHtml = '<span style="color:#ffb27d;">ショップ自動購入 停止中</span>';
+    } else if (state.goal1) {
       var bankNow = 0;
       try { bankNow = W.Game.cookies; } catch (e) { bankNow = 0; }
       var goalLine = function (tag, g) {
@@ -3040,7 +3080,9 @@ function fmt(n) {
     var barEl = document.getElementById('ccauto-bar');
     if (barEl) {
       var pct = 0;
-      if (state.goal1) {
+      if (shopOff) {
+        pct = 0;
+      } else if (state.goal1) {
         // 進捗バーは「いま遂行中の目標」の達成率を表示する
         pct = (state.goalActive === 2 && state.goal2) ? state.goal2.pct : state.goal1.pct;
       } else if (gameReady() && state.targetPrice > 0) {
@@ -3057,6 +3099,13 @@ function fmt(n) {
     if (wkEl) {
       var wkOn = gmGet('ccauto_wake', '') !== '0';
       wkEl.textContent = !wkOn ? '💡 画面維持' : (wakeLockObj ? '💡 画面維持:ON' : '💡 画面維持:試行中');
+    }
+    // v2.3.39: 購入・昇天スイッチのラベル
+    var sbEl = document.getElementById('ccauto-shopbuy');
+    if (sbEl) sbEl.textContent = (gmGet('ccauto_shopBuy', '1') === '1') ? '🛒 購入:ON' : '🛒 購入:OFF';
+    var asEl = document.getElementById('ccauto-ascend');
+    if (asEl) {
+      asEl.textContent = '🚀 自動昇天:' + (gmGet('ccauto_autoAscend', '1') === '1' ? 'ON' : 'OFF') + (ascendBusy() ? '（昇天中）' : '');
     }
     lg.innerHTML = state.logs.slice(0, 12).map(function (s) {
       return s.replace(/</g, '&lt;');
@@ -3463,7 +3512,6 @@ function fmt(n) {
     reportError('自動昇天を停止しました: ' + msg);
   }
   function ascendMaybeStart(G) {
-    if (gmGet('ccauto_autoAscend', '1') !== '1') return;
     if (!state.running || state.mode !== 'auto') return;
     // 昇天の開始直前にも所有者を照合する（v2.3.30）: 主張を失っていたら始めない
     if (claimIsForeignFresh(tabClaimRead())) { tabSetRole(false); return; }
@@ -3478,7 +3526,8 @@ function fmt(n) {
       return;
     }
     var chips = chipsThisRun(G);
-    sampleChips(G, chips);
+    sampleChips(G, chips); // チップの観測は自動昇天OFFの間も続ける（ONに戻した直後の鈍化判定が古い標本にならないように。v2.3.39、ChatGPTレビュー）
+    if (gmGet('ccauto_autoAscend', '1') !== '1') return; // ここから先は「新しい昇天を始めるか」の判定
     var target = ascendTargetFor(G);
     if (chips < target) return;
     if ((G.resets || 0) >= 1 && !paceFlattened(G, chips, target)) return; // 2周目以降は伸びが鈍ってから
