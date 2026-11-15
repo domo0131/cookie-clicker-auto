@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.43
+// @version      2.3.44
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.43'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.44'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -2876,6 +2876,24 @@ function fmt(n) {
         },
         // 購入リスト再生の進み具合（v2.3.41）
         replay: state.replayInfo ? { idx: state.replayInfo.idx, total: state.replayInfo.total, label: state.replayInfo.label } : null
+      };
+    } catch (e) { /* ignore */ }
+    // 画面ズームの診断（v2.3.44）: 主要要素の矩形とビューポート寸法を載せ、
+    // ショップ列が画面外に出る原因を実測で切り分ける
+    try {
+      var rectOf = function (id) {
+        var el = document.getElementById(id);
+        if (!el) return null;
+        var r = el.getBoundingClientRect();
+        return [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)];
+      };
+      var vv = W.visualViewport;
+      status.geo = {
+        iw: W.innerWidth, ih: W.innerHeight,
+        cw: document.documentElement ? document.documentElement.clientWidth : 0,
+        vv: vv ? [Math.round(vv.width), Math.round(vv.height), Math.round(vv.offsetLeft), Math.round(vv.offsetTop), Math.round(vv.scale * 100) / 100] : null,
+        zoom: document.documentElement ? (document.documentElement.style.zoom || '') : '',
+        game: rectOf('game'), left: rectOf('sectionLeft'), mid: rectOf('sectionMiddle'), right: rectOf('sectionRight'), store: rectOf('store'), panel: rectOf('ccauto-panel')
       };
     } catch (e) { /* ignore */ }
     // エラー記録（新しい順・最大10件）を状態に載せる。Muse側のチェッカーが新しいものをチャットへ報告する
