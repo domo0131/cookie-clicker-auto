@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.48
+// @version      2.3.49
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.48'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.49'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1530,12 +1530,14 @@ function fmt(n) {
     return 'off';
   }
   // 戻り値: 'active' = 再生がこの回を担当（購入した/待っている）/ 'off' = 通常購入へ
-  // ===== 周回開始スプリント（v2.3.47、ユーザー指示＋ChatGPTレビュー） =====
-  // 周回の最初だけ、通常の回収順位付けより先に (1) 少額アップグレードの掃引、
-  // (2) 建物の100軒（届かなければ次の節目）までの括り買い を行い、1個ずつの
-  // 購入が量産されるロスをなくす。歯止め: 収入 R（バフなしCpS＋クリック収入）に
-  // 対し、掃引は1件 R×1・1掃引合計 R×5 まで、チャンクは総額 R×5 まで。
-  // 高額品・測れない品は通常評価に渡す。窓は開始から3分（延長なし）。
+  // ===== 周回開始スプリント（v2.3.47、新ルール v2.3.49、ユーザー指示＋ChatGPTレビュー） =====
+  // 周回の最初の3分間だけ通常購入を止め、(1) ショップに出ている対象アップグレードを
+  // 買えるものから最安順に全部買い、(2) 建物はちょうど100個単位でだけ買う。
+  // 価格上限・回収順位付けはしない。買えるものが無い間も窓が閉じるまで待機し、
+  // 通常購入の端数を混ぜない。窓は開始から3分（延長なし）で、終了は常に timeout。
+  // 全建物100軒到達は状態（all100）として記録するだけで、早期終了はしない。
+  // 対象アップグレード: isBlockedUpgrade でなく isGlobalAdmissible を通る店頭品
+  // （建物ひも付き・シナジー・全体系を含む。tech/toggle/prestige/debug/卵系は除外）。
   // 試験中（ccauto_sprintMode = '1'、既定）は再生を使わず「スプリント→通常購入」。
   var sprintStateCache = null;
   function sprintLoadState(runNo, anchorAt) {
@@ -1543,7 +1545,7 @@ function fmt(n) {
     var st = null;
     try { st = gmGet('ccauto_sprint', null); } catch (e) { st = null; }
     if (!st || st.run !== runNo || typeof st.startedAt !== 'number') {
-      st = { run: runNo, startedAt: anchorAt || Date.now(), done: '', sweepSpent: 0, bought: 0 };
+      st = { run: runNo, startedAt: anchorAt || Date.now(), done: '', sweepSpent: 0, bought: 0, all100: 0 };
       try { gmSet('ccauto_sprint', st); } catch (e) { /* ignore */ }
     }
     sprintStateCache = st;
@@ -1562,77 +1564,44 @@ function fmt(n) {
     } catch (e) { /* ignore */ }
     return null; // 正確な総額が取れないチャンクは見送る（レビュー指示）
   }
-  function sprintPickUpgrade(G, R, st) {
+  function sprintPickUpgrade(G, bank, st) {
+    // ショップに出ている対象品を全部買う（v2.3.49）。価格上限なし。
+    // 対象: 未購入・skip でない・isBlockedUpgrade でない・isGlobalAdmissible を通るもの
+    // （建物ひも付き・シナジー・全体系を含む。tech/toggle/prestige/debug/卵系は除外）
     var store = [];
     try { store = G.UpgradesInStore || []; } catch (e) { store = []; }
-    var best = null;
+    var aff = null, wait = null;
     for (var i = 0; i < store.length; i++) {
       var up = store[i];
       if (!up || up.bought) continue;
       if (st['skipU_' + up.name]) continue;
       if (isBlockedUpgrade(up)) continue;
-      var pool = '';
-      try { pool = up.pool || ''; } catch (e) { pool = ''; }
-      if (pool === 'toggle') continue;
-      if (up.buildingTie2) continue;
-      if (!up.buildingTie1 && !isGlobalAdmissible(up)) continue;
+      if (!isGlobalAdmissible(up)) continue;
       var price = 0;
       try { price = (typeof up.getPrice === 'function') ? up.getPrice() : up.basePrice; } catch (e) { price = up.basePrice || 0; }
-      if (!(price >= 0) || price > R) continue; // 1件あたり収入1秒分まで
-      if (st.sweepSpent + price > R * 5) continue; // 掃引1回の合計は収入5秒分まで
-      if (!best || price < best.price) best = { ref: up, name: up.name, price: price };
+      if (!(price >= 0)) continue;
+      var cand = { ref: up, name: up.name, price: price };
+      if (price <= bank) { if (!aff || price < aff.price) aff = cand; }
+      else if (!wait || price < wait.price) wait = cand;
     }
-    return best;
+    return { aff: aff, wait: wait };
   }
-  function sprintPickChunk(G, R, bank, st) {
-    var cpsNow = baseCps();
-    var rawSum = 0;
-    try { for (var rk in G.Objects) { rawSum += G.Objects[rk].storedTotalCps || 0; } } catch (e) { rawSum = 0; }
-    var flatCps = 0;
-    try { if (G.Has && (G.Has('egg') || G.Has('\"egg\"'))) flatCps = 9; } catch (e) { flatCps = 0; }
-    var gMult = (rawSum + flatCps) > 0 ? cpsNow / (rawSum + flatCps) : 1;
-    if (!(gMult > 0) || !isFinite(gMult)) gMult = 1;
-    var clickBoost = 1;
-    try { clickBoost = clickBoostNow(measuredClickRate()); } catch (e) { clickBoost = 1; }
-    var bestAff = null, bestWait = null;
+  function sprintPickChunk(G, bank, st) {
+    // 建物はちょうど100個単位でだけ買う（v2.3.49）。所持数・節目は関係なく、
+    // 「今の所持数＋100」を1回分とし、正確な合計額（getSumPrice）が取れるものだけを対象にする。
+    // 順位は合計額の安い順（利得の概算はしない）
+    var aff = null, wait = null;
     for (var key in G.Objects) {
       var obj = G.Objects[key];
       if (!obj || obj.locked) continue;
-      var amt = obj.amount || 0;
-      if (amt >= 100) continue;
       if (st['skipB_' + obj.name]) continue;
-      var cand = null;
-      var q100 = 100 - amt;
-      var p100 = sprintExactSum(obj, q100);
-      if (p100 != null && p100 <= R * 5) {
-        cand = { qty: q100, price: p100, target: 100 };
-      } else {
-        var T = amt < 25 ? 25 : (amt < 50 ? 50 : 100);
-        var qT = T - amt;
-        if (qT > 0 && qT < q100) {
-          var pT = sprintExactSum(obj, qT);
-          if (pT != null && pT <= R * 5) cand = { qty: qT, price: pT, target: T };
-        }
-      }
-      if (!cand) continue;
-      var unit = 0;
-      try { unit = buildingGainOf(obj, cpsNow, gMult, clickBoost); } catch (e) { unit = 0; }
-      if (!(unit > 0)) continue;
-      var gain = unit * cand.qty;
-      // 節目到達で既存分も倍化する分を概算に足す（順位付け専用の近似）
-      gain += (obj.storedTotalCps || 0) * gMult * clickBoost;
-      cand.ref = obj;
-      cand.gain = gain;
-      cand.payback = cand.price / gain;
-      cand.label = obj.name + '（' + (amt + cand.qty) + '軒目）';
-      if (cand.price <= bank) {
-        if (!bestAff || cand.payback < bestAff.payback) bestAff = cand;
-      } else {
-        cand.eta = R > 0 ? (cand.price - bank) / R : Infinity;
-        if (!bestWait || cand.payback < bestWait.payback) bestWait = cand;
-      }
+      var p100 = sprintExactSum(obj, 100);
+      if (p100 == null) continue;
+      var cand = { ref: obj, qty: 100, price: p100, label: obj.name + '（' + ((obj.amount || 0) + 100) + '軒目）' };
+      if (p100 <= bank) { if (!aff || p100 < aff.price) aff = cand; }
+      else if (!wait || p100 < wait.price) wait = cand;
     }
-    return { aff: bestAff, wait: bestWait };
+    return { aff: aff, wait: wait };
   }
   function sprintAllHundred(G) {
     try {
@@ -1661,51 +1630,72 @@ function fmt(n) {
       state.sprintInfo = null;
       return 'off';
     }
-    if (buffSignature() !== '') return 'off'; // バフ中は一時停止（窓の期限は延長しない）
     if (G.recalculateGains) { buyDelayHint = 150; return 'active'; }
-    var R = 0;
-    try { R = totalIncome(baseCps()); } catch (e) { R = 0; }
-    if (!(R > 0)) return 'off'; // 収入の物差しが立つまでは通常購入に任せる
+    // 全建物100軒の到達は状態として記録するだけ（早期終了はしない。ChatGPTレビュー）
+    if (!st.all100 && sprintAllHundred(G)) {
+      st.all100 = 1; sprintSaveState(st);
+      log('スプリント中に全建物100軒へ到達しました（スプリントは開始から3分まで継続します）');
+    }
     var bank = G.cookies || 0;
-    // (1) 少額アップグレードの掃引（1サイクル1件）
-    var sweep = sprintPickUpgrade(G, R, st);
-    if (sweep) {
-      state.sprintInfo = { phase: 'sweep', label: sweep.name };
-      state.actualNext = { label: sweep.name, price: Math.round(sweep.price), kind: 'upgrade', mode: 'candidate' };
-      var gotU = doBuy({ kind: 'upgrade', ref: sweep.ref, label: sweep.name, price: sweep.price, gain: 0, payback: Infinity, noVerify: true, __src: 'sprint' });
-      if (gotU) { st.sweepSpent += sweep.price; st.bought++; }
-      else st['skipU_' + sweep.name] = 1;
+    // (1) アップグレード全買い（買えるものから最安順、1サイクル1件）
+    var up = sprintPickUpgrade(G, bank, st);
+    if (up.aff) {
+      state.sprintInfo = { phase: 'sweep', label: up.aff.name };
+      state.actualNext = { label: up.aff.name, price: Math.round(up.aff.price), kind: 'upgrade', mode: 'sprint' };
+      var gotU = doBuy({ kind: 'upgrade', ref: up.aff.ref, label: up.aff.name, price: up.aff.price, gain: 0, payback: Infinity, noVerify: true, __src: 'sprint' });
+      if (gotU) { st.bought++; buyDelayHint = CONFIG.buyRestMs; }
+      else st['skipU_' + up.aff.name] = 1;
       sprintSaveState(st);
       evalCache = null;
       return 'active';
     }
-    // (2) 建物チャンク
-    var pick = sprintPickChunk(G, R, bank, st);
-    if (pick.aff) {
-      var c = pick.aff;
+    // (2) 建物チャンク（ちょうど100個）
+    var ck = sprintPickChunk(G, bank, st);
+    if (ck.aff) {
+      // 売却モードの間は買わず、skip も付けずに保留する（ChatGPTレビュー）
+      var sellMode = false;
+      try { sellMode = (typeof G.buyMode === 'number' && G.buyMode !== 1); } catch (e) { sellMode = false; }
+      if (sellMode) { buyDelayHint = 500; return 'active'; }
+      var c = ck.aff;
       state.sprintInfo = { phase: 'chunk', label: c.label };
-      state.actualNext = { label: c.label, price: Math.round(c.price), kind: 'building', mode: 'candidate' };
-      var gotQ = doBuy({ kind: 'building', ref: c.ref, label: c.label, price: c.price, gain: c.gain, payback: c.payback, qty: c.qty, __src: 'sprint' });
-      st.sweepSpent = 0; // 建物を買ったら掃引予算は次の掃引へ
-      if (gotQ) st.bought++;
-      else st['skipB_' + c.ref.name] = 1;
+      state.actualNext = { label: c.label, price: Math.round(c.price), kind: 'building', mode: 'sprint' };
+      var gotQ = doBuy({ kind: 'building', ref: c.ref, label: c.label, price: c.price, gain: 0, payback: Infinity, qty: 100, __src: 'sprint' });
+      if (gotQ) {
+        st.bought++;
+        buyDelayHint = CONFIG.buyRestMs;
+        if (gotQ < 100) {
+          // 部分購入: 実数は doBuy 側で履歴に残る。この建物はこの周回の候補から外し、
+          // 通常購入へは即座に戻さずスプリントの待機を続ける（ChatGPTレビュー）
+          st['skipB_' + c.ref.name] = 1;
+          log('スプリントメモ: ' + c.ref.name + ' は100個の予定で ' + gotQ + ' 個になりました。この周回のスプリントではこの建物を候補から外します');
+        }
+      } else {
+        st['skipB_' + c.ref.name] = 1;
+      }
       sprintSaveState(st);
       return 'active';
     }
-    if (pick.wait && pick.wait.eta <= 10) {
-      // 上限内のチャンクが数秒で買えるなら、その分だけ待つ（長い貯金はしない）
-      state.sprintInfo = { phase: 'wait', label: pick.wait.label };
-      state.actualNext = { label: pick.wait.label, price: Math.round(pick.wait.price), kind: 'building', mode: 'candidate' };
-      buyDelayHint = Math.max(100, Math.min(1000, Math.round(pick.wait.eta * 1000)));
-      return 'active';
+    // (3) 買えるものが無い間は、窓が閉じるまで待機する（通常購入の端数を混ぜない）
+    var R = 0;
+    try { R = totalIncome(baseCps()); } catch (e) { R = 0; }
+    var waitCand = null;
+    var wcList = [];
+    if (up.wait) wcList.push({ label: up.wait.name, price: up.wait.price, kind: 'upgrade' });
+    if (ck.wait) wcList.push({ label: ck.wait.label, price: ck.wait.price, kind: 'building' });
+    for (var wi = 0; wi < wcList.length; wi++) {
+      var wc = wcList[wi];
+      wc.eta = R > 0 ? (wc.price - bank) / R : Infinity;
+      if (!waitCand || wc.eta < waitCand.eta) waitCand = wc;
     }
-    // (3) 有効な手がない。立ち上げ直後（30秒未満・実績なし）は通常購入に譲り、後で入る
-    if (!st.bought && now - st.startedAt < 30000) return 'off';
-    st.done = sprintAllHundred(G) ? 'all100' : 'nomove';
-    sprintSaveState(st);
-    log('序盤スプリントを終了しました（' + (st.done === 'all100' ? '全建物100軒に到達' : '上限内で買えるものが無くなりました') + '）。通常の購入に切り替えます');
-    state.sprintInfo = null;
-    return 'off';
+    if (waitCand) {
+      state.sprintInfo = { phase: 'wait', label: waitCand.label };
+      state.actualNext = { label: waitCand.label, price: Math.round(waitCand.price), kind: waitCand.kind, mode: 'sprint' };
+      buyDelayHint = isFinite(waitCand.eta) ? Math.max(100, Math.min(1000, Math.round(waitCand.eta * 1000))) : 1000;
+    } else {
+      state.sprintInfo = { phase: 'wait', label: '購入候補なし' };
+      buyDelayHint = 1000;
+    }
+    return 'active';
   }
 
   function replayStep() {
@@ -3074,7 +3064,7 @@ function fmt(n) {
           try {
             var ss = gmGet('ccauto_sprint', null);
             if (ss && typeof ss.run === 'number') {
-              return { run: ss.run, done: ss.done || '', bought: ss.bought || 0, startedAt: ss.startedAt || 0 };
+              return { run: ss.run, done: ss.done || '', bought: ss.bought || 0, startedAt: ss.startedAt || 0, all100: !!ss.all100 };
             }
           } catch (e) { /* ignore */ }
           return null;
@@ -3649,6 +3639,7 @@ function fmt(n) {
         nxHtml += '<br>実際に次に買う: ' + esc(an.label) + '（' + fmt(an.price) + '）';
         if (an.mode === 'interim') nxHtml += '<br><span style="color:#ffd98a;">第1目標より先に買います</span>';
         else if (an.mode === 'candidate') nxHtml += '<br><span style="color:#ffd98a;">貯金の合間に買う候補（効率が勝れば先に買います）</span>';
+        else if (an.mode === 'sprint') nxHtml += '<br><span style="color:#ffd98a;">スプリント中（建物は100個単位・ショップは全買い）</span>';
       }
       if (state.lastInterim && state.lastInterim.goal === state.goal1.label) {
         var liD = new Date(state.lastInterim.at);
