@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.49
+// @version      2.3.50
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.49'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.50'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -1322,9 +1322,11 @@ function fmt(n) {
     }
     // まとめ買い（v2.3.17）: バッチ全体の増産を実測し、検証用の予測にする。
     // 実測できなければ単位予測×個数の概算に切り替える（購入自体は止めない）
+    // v2.3.50: 予測の用途は購入後検証（pendingVerify）だけなので、noVerify の購入では
+    // シミュレーション自体を省く（スプリントの建物購入の高速化。個数の確認は戻り値で別途行う）
     var bulkQty = (cand.kind === 'building' && typeof cand.qty === 'number' && cand.qty > 1) ? Math.floor(cand.qty) : 1;
     var bulkPredCps = null;
-    if (bulkQty > 1) {
+    if (bulkQty > 1 && !cand.noVerify) {
       var bSimGain = 0;
       var simOut = {};
       try { bSimGain = simulatedBuildingGain(cand.ref, baseCps(), bulkQty, simOut); } catch (eS) { bSimGain = 0; }
@@ -1538,7 +1540,21 @@ function fmt(n) {
   // 全建物100軒到達は状態（all100）として記録するだけで、早期終了はしない。
   // 対象アップグレード: isBlockedUpgrade でなく isGlobalAdmissible を通る店頭品
   // （建物ひも付き・シナジー・全体系を含む。tech/toggle/prestige/debug/卵系は除外）。
+  // v2.3.50: 高速化。建物購入は noVerify で doBuy の予測シミュレーションを省き、
+  // 成功後の休止は専用の sprintRestMs（GM ccauto_sprintRestMs、既定50ms・30〜100ms）。
   // 試験中（ccauto_sprintMode = '1'、既定）は再生を使わず「スプリント→通常購入」。
+  function sprintRestMs() {
+    // スプリント成功後の休止（v2.3.50、ChatGPTレビュー）。購入チェーンの下限が30msのため
+    // 30〜100msに制限し、不正値は既定の50msに戻す。GM ccauto_sprintRestMs で調整可能
+    var v = 50;
+    try {
+      var raw = gmGet('ccauto_sprintRestMs', null);
+      if (raw != null && raw !== '') { var n = parseInt(raw, 10); if (isFinite(n)) v = n; }
+    } catch (e) { /* ignore */ }
+    if (v < 30) v = 30;
+    if (v > 100) v = 100;
+    return v;
+  }
   var sprintStateCache = null;
   function sprintLoadState(runNo, anchorAt) {
     if (sprintStateCache && sprintStateCache.run === runNo) return sprintStateCache;
@@ -1643,7 +1659,7 @@ function fmt(n) {
       state.sprintInfo = { phase: 'sweep', label: up.aff.name };
       state.actualNext = { label: up.aff.name, price: Math.round(up.aff.price), kind: 'upgrade', mode: 'sprint' };
       var gotU = doBuy({ kind: 'upgrade', ref: up.aff.ref, label: up.aff.name, price: up.aff.price, gain: 0, payback: Infinity, noVerify: true, __src: 'sprint' });
-      if (gotU) { st.bought++; buyDelayHint = CONFIG.buyRestMs; }
+      if (gotU) { st.bought++; buyDelayHint = sprintRestMs(); }
       else st['skipU_' + up.aff.name] = 1;
       sprintSaveState(st);
       evalCache = null;
@@ -1659,10 +1675,10 @@ function fmt(n) {
       var c = ck.aff;
       state.sprintInfo = { phase: 'chunk', label: c.label };
       state.actualNext = { label: c.label, price: Math.round(c.price), kind: 'building', mode: 'sprint' };
-      var gotQ = doBuy({ kind: 'building', ref: c.ref, label: c.label, price: c.price, gain: 0, payback: Infinity, qty: 100, __src: 'sprint' });
+      var gotQ = doBuy({ kind: 'building', ref: c.ref, label: c.label, price: c.price, gain: 0, payback: Infinity, qty: 100, noVerify: true, __src: 'sprint' });
       if (gotQ) {
         st.bought++;
-        buyDelayHint = CONFIG.buyRestMs;
+        buyDelayHint = sprintRestMs();
         if (gotQ < 100) {
           // 部分購入: 実数は doBuy 側で履歴に残る。この建物はこの周回の候補から外し、
           // 通常購入へは即座に戻さずスプリントの待機を続ける（ChatGPTレビュー）
