@@ -1,0 +1,427 @@
+// ==UserScript==
+// @name         くらふとRPG オート（そうげん連打）
+// @namespace    muse.kurafuto-rpg
+// @version      1.0.0
+// @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
+// @match        https://80866.play.unityroom.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  var SCRIPT_VERSION = '1.0.0';
+
+  // ---------- 設定（GM に保存） ----------
+  function load(key, def) {
+    try {
+      var v = GM_getValue(key, def);
+      return (v === undefined || v === null) ? def : v;
+    } catch (e) { return def; }
+  }
+  function save(key, val) { try { GM_setValue(key, val); } catch (e) {} }
+
+  var cfg = {
+    method: load('kr_method', 'mouse'),     // mouse / mouseMove / pointer / click / touch
+    intervalMs: load('kr_intervalMs', 200), // クリック間隔(ms)
+    pressMs: 50,                            // 押下→解放の間隔(ms)
+    fleeEvery: load('kr_fleeEvery', 0),     // 0=逃走しない / N=攻撃N回ごとに1回逃走
+    limitMin: load('kr_limitMin', 5),       // 0=無制限
+    atk: load('kr_atk', null),              // {u, v} canvas 内の相対座標
+    flee: load('kr_flee', null)             // {u, v}
+  };
+
+  var METHOD_LABEL = {
+    mouse: 'A: マウス',
+    mouseMove: 'B: マウス(移動つき)',
+    pointer: 'C: ポインター',
+    click: 'D: クリックのみ',
+    touch: 'E: タッチ'
+  };
+
+  // ---------- 状態 ----------
+  var canvas = null;
+  var running = false;
+  var timer = null;
+  var elapsedTimer = null;
+  var startedAt = 0;
+  var attackCount = 0;
+  var fleeCount = 0;
+  var sinceFlee = 0;
+  var stopReason = '';
+  var calibTarget = null; // 'atk' | 'flee' | null
+  var overlay = null;
+  var panel = null, statusEl = null, startBtn = null, stopBtn = null;
+  var markerAtk = null, markerFlee = null;
+
+  // ---------- canvas 検出 ----------
+  function findCanvas() {
+    var list = document.querySelectorAll('canvas');
+    var best = null, bestArea = 0;
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i];
+      var area = c.clientWidth * c.clientHeight;
+      if (area > bestArea && c.clientWidth >= 200) { best = c; bestArea = area; }
+    }
+    return best;
+  }
+
+  // ---------- 入力送信 ----------
+  function makeMouse(type, x, y, buttons) {
+    return new MouseEvent(type, {
+      bubbles: true, cancelable: true, view: window,
+      clientX: Math.round(x), clientY: Math.round(y),
+      button: 0, buttons: buttons
+    });
+  }
+
+  function isBlockingTarget(t) {
+    if (!t || t === canvas) return false;
+    // canvas の祖先（透明なラッパー等）はブロック扱いしない
+    var n = canvas;
+    while (n) { if (n === t) return false; n = n.parentElement; }
+    return true;
+  }
+
+  // 1回分の押下→解放を送る。done(ok) は解放後に呼ばれる。
+  function dispatchPress(pos, done) {
+    var r = canvas.getBoundingClientRect();
+    var x = r.left + pos.u * r.width;
+    var y = r.top + pos.v * r.height;
+    var target = document.elementFromPoint(x, y);
+    if (isBlockingTarget(target)) {
+      fail('ボタンの上に別の要素があります（画面変化の可能性）');
+      if (done) done(false);
+      return;
+    }
+    var m = cfg.method;
+    try {
+      if (m === 'click') {
+        canvas.dispatchEvent(makeMouse('click', x, y, 0));
+        if (done) done(true);
+        return;
+      }
+      if (m === 'pointer') {
+        canvas.dispatchEvent(new PointerEvent('pointerdown', {
+          bubbles: true, cancelable: true, view: window,
+          clientX: x, clientY: y, button: 0, buttons: 1,
+          pointerId: 1, isPrimary: true, pointerType: 'mouse'
+        }));
+        setTimeout(function () {
+          canvas.dispatchEvent(new PointerEvent('pointerup', {
+            bubbles: true, cancelable: true, view: window,
+            clientX: x, clientY: y, button: 0, buttons: 0,
+            pointerId: 1, isPrimary: true, pointerType: 'mouse'
+          }));
+          if (done) done(true);
+        }, cfg.pressMs);
+        return;
+      }
+      if (m === 'touch') {
+        var t1 = new Touch({ identifier: 1, target: canvas, clientX: x, clientY: y });
+        canvas.dispatchEvent(new TouchEvent('touchstart', {
+          bubbles: true, cancelable: true,
+          touches: [t1], targetTouches: [t1], changedTouches: [t1]
+        }));
+        setTimeout(function () {
+          var t2 = new Touch({ identifier: 1, target: canvas, clientX: x, clientY: y });
+          canvas.dispatchEvent(new TouchEvent('touchend', {
+            bubbles: true, cancelable: true,
+            touches: [], targetTouches: [], changedTouches: [t2]
+          }));
+          if (done) done(true);
+        }, cfg.pressMs);
+        return;
+      }
+      // mouse / mouseMove
+      if (m === 'mouseMove') canvas.dispatchEvent(makeMouse('mousemove', x, y, 0));
+      canvas.dispatchEvent(makeMouse('mousedown', x, y, 1));
+      setTimeout(function () {
+        canvas.dispatchEvent(makeMouse('mouseup', x, y, 0));
+        if (done) done(true);
+      }, cfg.pressMs);
+    } catch (e) {
+      fail('入力送信でエラー: ' + e.message);
+      if (done) done(false);
+    }
+  }
+
+  function fail(msg) {
+    if (running) stopRun(msg);
+    else setStatus(msg);
+  }
+
+  // ---------- 連打ループ ----------
+  function tick() {
+    if (!running) return;
+    try {
+      if (!canvas || !document.contains(canvas)) { stopRun('canvas が見つかりません'); return; }
+      if (cfg.limitMin > 0 && Date.now() - startedAt >= cfg.limitMin * 60000) { stopRun('制限時間に到達'); return; }
+      if (!cfg.atk) { stopRun('こうげき座標が未設定です'); return; }
+      dispatchPress(cfg.atk, function (ok) {
+        if (!running || !ok) return;
+        attackCount++; sinceFlee++;
+        updateStatus();
+        if (cfg.fleeEvery > 0 && cfg.flee && sinceFlee >= cfg.fleeEvery) {
+          sinceFlee = 0;
+          setTimeout(function () {
+            if (!running) return;
+            dispatchPress(cfg.flee, function (ok2) {
+              if (ok2) fleeCount++;
+              updateStatus();
+              if (running) timer = setTimeout(tick, 400);
+            });
+          }, 250);
+        } else {
+          timer = setTimeout(tick, cfg.intervalMs);
+        }
+      });
+    } catch (e) {
+      stopRun('エラー: ' + e.message);
+    }
+  }
+
+  function startRun() {
+    if (running) return;
+    if (!cfg.atk) { setStatus('先に「こうげき座標」を設定してください'); return; }
+    running = true;
+    stopReason = '';
+    attackCount = 0; fleeCount = 0; sinceFlee = 0;
+    startedAt = Date.now();
+    elapsedTimer = setInterval(updateStatus, 500);
+    updatePanel();
+    updateStatus();
+    tick();
+  }
+
+  function stopRun(reason) {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+    if (running && reason) stopReason = reason;
+    running = false;
+    updatePanel();
+    updateStatus();
+  }
+
+  // ---------- 座標登録 ----------
+  function startCalib(target) {
+    if (running) return;
+    if (calibTarget) { endCalib(); updatePanel(); return; }
+    calibTarget = target;
+    overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,0.25);touch-action:none;';
+    overlay.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var r = canvas.getBoundingClientRect();
+      var pos = { u: (e.clientX - r.left) / r.width, v: (e.clientY - r.top) / r.height };
+      if (target === 'atk') { cfg.atk = pos; save('kr_atk', pos); }
+      else { cfg.flee = pos; save('kr_flee', pos); }
+      endCalib();
+      drawMarkers();
+      updatePanel();
+      setStatus((target === 'atk' ? 'こうげき' : 'にげる') + ' の座標を登録しました');
+    }, { once: true });
+    document.body.appendChild(overlay);
+    setStatus((target === 'atk' ? 'こうげき' : 'にげる') + ' ボタンの中心をタップしてください');
+    updatePanel();
+  }
+
+  function endCalib() {
+    if (overlay) { overlay.remove(); overlay = null; }
+    calibTarget = null;
+  }
+
+  // ---------- マーカー ----------
+  function makeMarker(color) {
+    var d = document.createElement('div');
+    d.style.cssText = 'position:fixed;width:14px;height:14px;border-radius:50%;border:2px solid #fff;' +
+      'background:' + color + ';z-index:2147483640;pointer-events:none;transform:translate(-50%,-50%);display:none;';
+    document.body.appendChild(d);
+    return d;
+  }
+
+  function drawMarkers() {
+    if (!canvas) return;
+    var r = canvas.getBoundingClientRect();
+    placeMarker(markerAtk, cfg.atk, r);
+    placeMarker(markerFlee, cfg.flee, r);
+  }
+
+  function placeMarker(el, pos, r) {
+    if (!el) return;
+    if (!pos) { el.style.display = 'none'; return; }
+    el.style.display = 'block';
+    el.style.left = (r.left + pos.u * r.width) + 'px';
+    el.style.top = (r.top + pos.v * r.height) + 'px';
+  }
+
+  // ---------- パネル ----------
+  function setStatus(msg) { if (statusEl) statusEl.textContent = msg; }
+
+  function fmtTime(ms) {
+    var s = Math.floor(ms / 1000);
+    var m = Math.floor(s / 60);
+    var ss = ('0' + (s % 60)).slice(-2);
+    return m + ':' + ss;
+  }
+
+  function updateStatus() {
+    if (!statusEl) return;
+    if (running) {
+      statusEl.textContent = '実行中 ' + fmtTime(Date.now() - startedAt) +
+        ' / 攻撃 ' + attackCount + ' / 逃走 ' + fleeCount +
+        ' / ' + METHOD_LABEL[cfg.method] + ' ' + cfg.intervalMs + 'ms';
+    } else if (stopReason) {
+      statusEl.textContent = '停止: ' + stopReason + '（攻撃 ' + attackCount + ' / 逃走 ' + fleeCount + '）';
+    } else if (!calibTarget) {
+      statusEl.textContent = '停止中（攻撃 ' + attackCount + ' / 逃走 ' + fleeCount + '）';
+    }
+  }
+
+  function updatePanel() {
+    if (!panel) return;
+    startBtn.disabled = running;
+    stopBtn.disabled = !running;
+    startBtn.style.opacity = running ? '0.5' : '1';
+    stopBtn.style.opacity = running ? '1' : '0.5';
+  }
+
+  function buildPanel() {
+    panel = document.createElement('div');
+    panel.id = 'kr-panel';
+    panel.style.cssText = 'position:fixed;top:8px;left:8px;z-index:2147483647;background:rgba(20,20,28,0.88);' +
+      'color:#fff;font:13px/1.5 sans-serif;padding:8px 10px;border-radius:10px;max-width:78vw;user-select:none;-webkit-user-select:none;';
+    panel.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">' +
+        '<b>くらふとRPG オート v' + SCRIPT_VERSION + '</b>' +
+        '<button id="kr-min" style="min-width:36px;min-height:30px;">－</button>' +
+      '</div>' +
+      '<div id="kr-body">' +
+        '<div id="kr-status" style="margin:4px 0 6px;">停止中</div>' +
+        '<div style="display:flex;gap:6px;margin-bottom:6px;">' +
+          '<button id="kr-start" style="flex:1;min-height:42px;font-size:15px;">▶ 開始</button>' +
+          '<button id="kr-stop" style="flex:1;min-height:42px;font-size:15px;">■ 停止</button>' +
+        '</div>' +
+        '<div style="display:flex;gap:6px;margin-bottom:6px;">' +
+          '<button id="kr-cal-atk" style="flex:1;min-height:38px;">◎ こうげき座標</button>' +
+          '<button id="kr-cal-flee" style="flex:1;min-height:38px;">◎ にげる座標</button>' +
+        '</div>' +
+        '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">' +
+          '<button id="kr-test" style="min-height:38px;">単発テスト</button>' +
+          '<select id="kr-method" style="min-height:38px;flex:1;">' +
+            '<option value="mouse">A: マウス</option>' +
+            '<option value="mouseMove">B: マウス(移動つき)</option>' +
+            '<option value="pointer">C: ポインター</option>' +
+            '<option value="click">D: クリックのみ</option>' +
+            '<option value="touch">E: タッチ</option>' +
+          '</select>' +
+        '</div>' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">' +
+          '<label>間隔 <select id="kr-interval" style="min-height:34px;">' +
+            '<option value="100">100ms</option><option value="150">150ms</option>' +
+            '<option value="200">200ms</option><option value="300">300ms</option></select></label>' +
+          '<label>逃走 <select id="kr-flee-every" style="min-height:34px;">' +
+            '<option value="0">しない</option><option value="25">25回ごと</option>' +
+            '<option value="60">60回ごと</option><option value="150">150回ごと</option></select></label>' +
+          '<label>制限 <select id="kr-limit" style="min-height:34px;">' +
+            '<option value="5">5分</option><option value="30">30分</option>' +
+            '<option value="60">60分</option><option value="0">無制限</option></select></label>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(panel);
+
+    statusEl = panel.querySelector('#kr-status');
+    startBtn = panel.querySelector('#kr-start');
+    stopBtn = panel.querySelector('#kr-stop');
+
+    var body = panel.querySelector('#kr-body');
+    panel.querySelector('#kr-min').addEventListener('click', function () {
+      body.style.display = (body.style.display === 'none') ? '' : 'none';
+      this.textContent = (body.style.display === 'none') ? '＋' : '－';
+    });
+
+    startBtn.addEventListener('click', startRun);
+    stopBtn.addEventListener('click', function () { stopRun('手動停止'); });
+    panel.querySelector('#kr-cal-atk').addEventListener('click', function () { startCalib('atk'); });
+    panel.querySelector('#kr-cal-flee').addEventListener('click', function () { startCalib('flee'); });
+    panel.querySelector('#kr-test').addEventListener('click', function () {
+      if (running) return;
+      if (!cfg.atk) { setStatus('先に「こうげき座標」を設定してください'); return; }
+      dispatchPress(cfg.atk, function (ok) {
+        setStatus(ok ? ('単発テスト送信: ' + METHOD_LABEL[cfg.method] + '（HPバーが減ったか見てください）')
+                     : '単発テスト失敗（上の理由を確認）');
+      });
+    });
+
+    var methodSel = panel.querySelector('#kr-method');
+    methodSel.value = cfg.method;
+    methodSel.addEventListener('change', function () { cfg.method = this.value; save('kr_method', cfg.method); });
+
+    var intervalSel = panel.querySelector('#kr-interval');
+    intervalSel.value = String(cfg.intervalMs);
+    intervalSel.addEventListener('change', function () { cfg.intervalMs = parseInt(this.value, 10); save('kr_intervalMs', cfg.intervalMs); });
+
+    var fleeSel = panel.querySelector('#kr-flee-every');
+    fleeSel.value = String(cfg.fleeEvery);
+    fleeSel.addEventListener('change', function () { cfg.fleeEvery = parseInt(this.value, 10); save('kr_fleeEvery', cfg.fleeEvery); });
+
+    var limitSel = panel.querySelector('#kr-limit');
+    limitSel.value = String(cfg.limitMin);
+    limitSel.addEventListener('change', function () { cfg.limitMin = parseInt(this.value, 10); save('kr_limitMin', cfg.limitMin); });
+
+    updatePanel();
+  }
+
+  // ---------- 異常時の自動停止 ----------
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && running) stopRun('タブが非表示になりました');
+  });
+
+  var resizeTimer = null;
+  window.addEventListener('resize', function () {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      drawMarkers();
+      if (running) stopRun('画面サイズが変わりました');
+    }, 300);
+  });
+
+  // 実タップ（信頼済みイベント）で即停止。ただしパネル操作は除く。
+  function onTrustedInput(e) {
+    if (!running) return;
+    if (panel && panel.contains(e.target)) return;
+    stopRun('手動タップを検知しました');
+  }
+  document.addEventListener('touchstart', onTrustedInput, true);
+  document.addEventListener('mousedown', onTrustedInput, true);
+
+  // ---------- 起動 ----------
+  var bootTimer = setInterval(function () {
+    var c = findCanvas();
+    if (!c) return;
+    clearInterval(bootTimer);
+    canvas = c;
+    canvas.addEventListener('webglcontextlost', function () {
+      if (running) stopRun('WebGL コンテキストが失われました');
+    });
+    markerAtk = makeMarker('rgba(255,60,60,0.85)');
+    markerFlee = makeMarker('rgba(60,120,255,0.85)');
+    buildPanel();
+    drawMarkers();
+    // canvas の差し替え監視とマーカー追随
+    setInterval(function () {
+      var now = findCanvas();
+      if (now && now !== canvas) {
+        if (running) { stopRun('canvas が差し替わりました'); }
+        canvas = now;
+        canvas.addEventListener('webglcontextlost', function () {
+          if (running) stopRun('WebGL コンテキストが失われました');
+        });
+      }
+      drawMarkers();
+    }, 1000);
+  }, 500);
+})();
