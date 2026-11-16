@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.10
+// @version      1.0.11
 // @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '1.0.10';
+  var SCRIPT_VERSION = '1.0.11';
 
   // ---------- 設定（GM に保存） ----------
   function load(key, def) {
@@ -43,7 +43,7 @@
     pressMs: load('kr_pressMs', 30),        // 押下→解放の間隔(ms)。60fps の約2フレーム分
     fleeEvery: load('kr_fleeEvery', 0),     // 0=逃走しない / N=攻撃N回ごとに1回逃走
     limitMin: load('kr_limitMin', 5),       // 0=無制限
-    fingers: load('kr_fingers', 1),         // 同時タップ本数（方式Eのみ）: 1 or 2
+    fingers: load('kr_fingers', 1),         // 同時タップ本数（方式Eのみ）: 1〜4
     atk: load('kr_atk', null),              // {u, v} canvas 内の相対座標
     flee: load('kr_flee', null)             // {u, v}
   };
@@ -584,7 +584,8 @@
             '<option value="5">5分</option><option value="30">30分</option>' +
             '<option value="60">60分</option><option value="0">無制限</option></select></label>' +
           '<label>同時 <select id="kr-fingers" style="min-height:34px;">' +
-            '<option value="1">1本</option><option value="2">2本</option></select></label>' +
+            '<option value="1">1本</option><option value="2">2本</option>' +
+            '<option value="3">3本</option><option value="4">4本</option></select></label>' +
         '</div>' +
         '<div style="display:flex;gap:6px;margin-top:6px;">' +
           '<button id="kr-log-toggle" style="flex:1;min-height:34px;">ログ表示</button>' +
