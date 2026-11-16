@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.0
+// @version      1.0.1
 // @description  本体スクリプトを GitHub から自動で取りに行くローダーです。更新は自動で反映されます（連打の実行中は切り替えません）。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -50,9 +50,11 @@
   }
 
   // 本体が実行中かどうかは、本体が書くハートビート（kr_heartbeat）で判断する
+  // （数値形式と {t: 時刻} 形式の両方に対応する）
   function isRunning() {
     var hb = gmGet('kr_heartbeat', 0);
-    return !!hb && (Date.now() - hb < 4000);
+    var t = (hb && typeof hb === 'object') ? hb.t : hb;
+    return !!t && (Date.now() - t < 4000);
   }
 
   function tryApplyPending() {
@@ -78,8 +80,9 @@
           gmSet('kr_loader_version', v);
           cachedVer = v;
         }
-        if (isFirst && !ran) {
-          // 初回（キャッシュなし）: 取得した本体をそのまま実行する
+        if (!ran) {
+          // まだ本体を実行できていない（初回、または初回取得に失敗して再取得できた）:
+          // 取得した本体をそのまま実行する
           runBody(gmGet('kr_loader_body', res.responseText), gmGet('kr_loader_version', v));
           return;
         }

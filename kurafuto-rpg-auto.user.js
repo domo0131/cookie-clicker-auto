@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.8
+// @version      1.0.9
 // @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '1.0.8';
+  var SCRIPT_VERSION = '1.0.9';
 
   // ---------- 設定（GM に保存） ----------
   function load(key, def) {
@@ -25,6 +25,7 @@
 
   // ---------- 行動ログ（GM に最新200件を保持） ----------
   var LOG_KEY = 'kr_log';
+  var logRenderFn = null; // パネル構築時に renderLog を登録（開いている間は自動で再描画）
   function logEvent(msg) {
     try {
       var arr = GM_getValue(LOG_KEY, []);
@@ -33,14 +34,16 @@
       while (arr.length > 200) arr.shift();
       GM_setValue(LOG_KEY, arr);
     } catch (e) {}
+    if (logRenderFn) { try { logRenderFn(); } catch (e) {} }
   }
 
   var cfg = {
-    method: load('kr_method', 'mouse'),     // mouse / mouseMove / pointer / click / touch
+    method: load('kr_method', 'touch'),     // mouse / mouseMove / pointer / click / touch（新規は実績のある E を既定に）
     intervalMs: load('kr_intervalMs', 200), // クリック間隔(ms)
     pressMs: load('kr_pressMs', 30),        // 押下→解放の間隔(ms)。60fps の約2フレーム分
     fleeEvery: load('kr_fleeEvery', 0),     // 0=逃走しない / N=攻撃N回ごとに1回逃走
     limitMin: load('kr_limitMin', 5),       // 0=無制限
+    fingers: load('kr_fingers', 1),         // 同時タップ本数（方式Eのみ）: 1 or 2
     atk: load('kr_atk', null),              // {u, v} canvas 内の相対座標
     flee: load('kr_flee', null)             // {u, v}
   };
@@ -71,20 +74,30 @@
   // ---------- 状態 ----------
   var canvas = null;
   var running = false;
-  var timer = null;
+  var runGen = 0;              // 実行の世代。開始・停止のたびに増やし、古い予約コールバックを無効化する
+  var timer = null;            // 単指ループの次回 tick
+  var fleeTimer = null;        // 逃走までの待ちタイマー
   var elapsedTimer = null;
+  var hbTimer = null;          // ハートビート用タイマー
   var startedAt = 0;
   var attackCount = 0;
   var fleeCount = 0;
   var sinceFlee = 0;
   var warmupLeft = 0;
   var touchSeq = 0;
-  var lastHb = 0;
   var stopReason = '';
   var calibTarget = null; // 'atk' | 'flee' | null
   var overlay = null;
   var panel = null, statusEl = null, startBtn = null, stopBtn = null;
   var markerAtk = null, markerFlee = null;
+  var sessionId = 's' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
+  // 押下中（解放待ち）の記録。停止時に後始末（解放イベント）を送るために保持する
+  var inFlight = null; // {canvas, timer, release}
+  // 2本同時タップ用: identifier -> {x, y, kind, canvas, timer}
+  var parActive = {};
+  var parTimer = null;
+
+  function useParallel() { return cfg.fingers >= 2 && cfg.method === 'touch'; }
 
   // ---------- canvas 検出 ----------
   function findCanvas() {
@@ -107,71 +120,88 @@
     });
   }
 
-  function isBlockingTarget(t) {
-    if (!t || t === canvas) return false;
+  function isBlockingTarget(t, c) {
+    if (!t || t === c) return false;
     // canvas の祖先（透明なラッパー等）はブロック扱いしない
-    var n = canvas;
+    var n = c;
     while (n) { if (n === t) return false; n = n.parentElement; }
     return true;
   }
 
-  // 1回分の押下→解放を送る。done(ok) は解放後に呼ばれる。
-  function dispatchPress(pos, done) {
-    var r = canvas.getBoundingClientRect();
+  // 押下位置を画面座標に直し、塞がれていないか確認する。問題があれば fail して null を返す
+  function pressPoint(pos, c) {
+    var r = c.getBoundingClientRect();
+    if (!r.width || !r.height) { fail('canvas のサイズが取得できません'); return null; }
     var x = r.left + pos.u * r.width;
     var y = r.top + pos.v * r.height;
     var target = document.elementFromPoint(x, y);
-    if (isBlockingTarget(target)) {
-      fail('ボタンの上に別の要素があります（画面変化の可能性）');
-      if (done) done(false);
-      return;
-    }
+    if (!target) { fail('ボタンの位置が画面外です'); return null; }
+    if (isBlockingTarget(target, c)) { fail('ボタンの上に別の要素があります（画面変化の可能性）'); return null; }
+    return { x: x, y: y };
+  }
+
+  // 1回分の押下→解放を送る。done(ok) は解放後に呼ばれる。
+  // 押下開始時の canvas を固定し、解放も同じ canvas に送る。解放タイマーは inFlight に
+  // 登録され、停止時は stopRun が即座に解放して後始末する（旧世代のコールバックは gen で無効化）。
+  function dispatchPress(pos, gen, done) {
+    var c = canvas;
+    if (!c) { fail('canvas が見つかりません'); if (done) done(false); return; }
+    var pt = pressPoint(pos, c);
+    if (!pt) { if (done) done(false); return; }
+    var x = pt.x, y = pt.y;
     var m = cfg.method;
     try {
       if (m === 'click') {
-        canvas.dispatchEvent(makeMouse('click', x, y, 0));
+        c.dispatchEvent(makeMouse('click', x, y, 0));
         if (done) done(true);
         return;
       }
+      var releaseFn = null;
       if (m === 'pointer') {
-        canvas.dispatchEvent(new PointerEvent('pointerdown', {
+        c.dispatchEvent(new PointerEvent('pointerdown', {
           bubbles: true, cancelable: true,
           clientX: x, clientY: y, button: 0, buttons: 1,
           pointerId: 1, isPrimary: true, pointerType: 'mouse'
         }));
-        setTimeout(function () {
-          canvas.dispatchEvent(new PointerEvent('pointerup', {
+        releaseFn = function () {
+          c.dispatchEvent(new PointerEvent('pointerup', {
             bubbles: true, cancelable: true,
             clientX: x, clientY: y, button: 0, buttons: 0,
             pointerId: 1, isPrimary: true, pointerType: 'mouse'
           }));
-          if (done) done(true);
-        }, cfg.pressMs);
-        return;
-      }
-      if (m === 'touch') {
+        };
+      } else if (m === 'touch') {
         touchSeq++;
         var touchId = touchSeq;
-        var t1 = new Touch({ identifier: touchId, target: canvas, clientX: x, clientY: y });
-        canvas.dispatchEvent(new TouchEvent('touchstart', {
+        var t1 = new Touch({ identifier: touchId, target: c, clientX: x, clientY: y });
+        c.dispatchEvent(new TouchEvent('touchstart', {
           bubbles: true, cancelable: true,
           touches: [t1], targetTouches: [t1], changedTouches: [t1]
         }));
-        setTimeout(function () {
-          var t2 = new Touch({ identifier: touchId, target: canvas, clientX: x, clientY: y });
-          canvas.dispatchEvent(new TouchEvent('touchend', {
+        releaseFn = function () {
+          var t2 = new Touch({ identifier: touchId, target: c, clientX: x, clientY: y });
+          c.dispatchEvent(new TouchEvent('touchend', {
             bubbles: true, cancelable: true,
             touches: [], targetTouches: [], changedTouches: [t2]
           }));
-          if (done) done(true);
-        }, cfg.pressMs);
-        return;
+        };
+      } else {
+        // mouse / mouseMove
+        if (m === 'mouseMove') c.dispatchEvent(makeMouse('mousemove', x, y, 0));
+        c.dispatchEvent(makeMouse('mousedown', x, y, 1));
+        releaseFn = function () { c.dispatchEvent(makeMouse('mouseup', x, y, 0)); };
       }
-      // mouse / mouseMove
-      if (m === 'mouseMove') canvas.dispatchEvent(makeMouse('mousemove', x, y, 0));
-      canvas.dispatchEvent(makeMouse('mousedown', x, y, 1));
-      setTimeout(function () {
-        canvas.dispatchEvent(makeMouse('mouseup', x, y, 0));
+      var rec = { canvas: c, timer: null, release: releaseFn };
+      inFlight = rec;
+      rec.timer = setTimeout(function () {
+        if (inFlight === rec) inFlight = null;
+        try {
+          releaseFn();
+        } catch (e) {
+          fail('解放でエラー: ' + e.message);
+          if (done) done(false);
+          return;
+        }
         if (done) done(true);
       }, cfg.pressMs);
     } catch (e) {
@@ -180,40 +210,164 @@
     }
   }
 
+  // 停止時: 解放待ちの押下があれば、その場で解放して後始末する
+  function releaseInFlight() {
+    if (!inFlight) return;
+    var rec = inFlight;
+    inFlight = null;
+    if (rec.timer) clearTimeout(rec.timer);
+    try { rec.release(); } catch (e) {}
+  }
+
   function fail(msg) {
     if (running) stopRun(msg);
     else setStatus(msg);
   }
 
-  // ---------- 連打ループ ----------
-  function tick() {
-    if (!running) return;
+  // ---------- 連打ループ（単指） ----------
+  function runStopped(gen) { return !running || gen !== runGen; }
+
+  function tick(gen) {
+    if (runStopped(gen)) return;
     try {
       if (!canvas || !document.contains(canvas)) { stopRun('canvas が見つかりません'); return; }
+      if (document.hidden) { stopRun('タブが非表示になりました'); return; }
       if (cfg.limitMin > 0 && Date.now() - startedAt >= cfg.limitMin * 60000) { stopRun('制限時間に到達'); return; }
       if (!cfg.atk) { stopRun('こうげき座標が未設定です'); return; }
-      dispatchPress(cfg.atk, function (ok) {
-        if (!running || !ok) return;
+      dispatchPress(cfg.atk, gen, function (ok) {
+        if (runStopped(gen) || !ok) return;
         attackCount++; sinceFlee++;
         if (attackCount % 1000 === 0) logEvent('攻撃 ' + attackCount + ' 回（経過 ' + fmtTime(Date.now() - startedAt) + '）');
         updateStatus();
         if (cfg.fleeEvery > 0 && cfg.flee && sinceFlee >= cfg.fleeEvery) {
           sinceFlee = 0;
-          setTimeout(function () {
-            if (!running) return;
-            dispatchPress(cfg.flee, function (ok2) {
-              if (ok2) fleeCount++;
-              updateStatus();
-              if (running) timer = setTimeout(tick, 400);
-            });
-          }, 250);
+          fleeTimer = setTimeout(function () { fleeStep(gen); }, 250);
         } else {
-          timer = setTimeout(tick, effInterval());
+          timer = setTimeout(function () { tick(gen); }, effInterval());
         }
       });
     } catch (e) {
       stopRun('エラー: ' + e.message);
     }
+  }
+
+  // 逃走は発火直前に設定・制限・状態を再確認する（予約後に設定が変わっても誤発火しない）
+  function fleeStep(gen) {
+    fleeTimer = null;
+    if (runStopped(gen)) return;
+    if (cfg.fleeEvery <= 0 || !cfg.flee) { timer = setTimeout(function () { tick(gen); }, effInterval()); return; }
+    if (document.hidden) { stopRun('タブが非表示になりました'); return; }
+    if (cfg.limitMin > 0 && Date.now() - startedAt >= cfg.limitMin * 60000) { stopRun('制限時間に到達'); return; }
+    dispatchPress(cfg.flee, gen, function (ok) {
+      if (runStopped(gen)) return;
+      if (ok) fleeCount++;
+      updateStatus();
+      timer = setTimeout(function () { tick(gen); }, 400);
+    });
+  }
+
+  // ---------- 連打ループ（2本同時タップ、方式Eのみ） ----------
+  // 各指は 押下 pressMs のあいだ画面に残り、開始は (押下+間隔)/本数 ずつずらす。
+  // touches には押下中の全指を正しく入れる（他の指を消すイベント列にしない）。
+  function parStagger() {
+    var base = Math.round((cfg.pressMs + cfg.intervalMs) / Math.max(1, cfg.fingers));
+    if (warmupLeft > 0) return Math.max(base, 200);
+    return Math.max(5, base);
+  }
+
+  function parCadence(gen) {
+    if (runStopped(gen)) return;
+    if (!canvas || !document.contains(canvas)) { stopRun('canvas が見つかりません'); return; }
+    if (document.hidden) { stopRun('タブが非表示になりました'); return; }
+    if (cfg.limitMin > 0 && Date.now() - startedAt >= cfg.limitMin * 60000) { stopRun('制限時間に到達'); return; }
+    if (Object.keys(parActive).length < cfg.fingers) parPress(gen);
+    parTimer = setTimeout(function () { parCadence(gen); }, parStagger());
+  }
+
+  function parPress(gen) {
+    var c = canvas;
+    var kind = 'atk';
+    if (cfg.fleeEvery > 0 && cfg.flee && sinceFlee >= cfg.fleeEvery && !parHasFlee()) kind = 'flee';
+    var pos = (kind === 'flee') ? cfg.flee : cfg.atk;
+    if (!pos) return;
+    var pt = pressPoint(pos, c);
+    if (!pt) return; // fail() が停止まで面倒を見る
+    if (kind === 'flee') sinceFlee = 0;
+    if (warmupLeft > 0) warmupLeft--;
+    touchSeq++;
+    var id = touchSeq;
+    var rec = { x: pt.x, y: pt.y, kind: kind, canvas: c, timer: null };
+    parActive[id] = rec;
+    try {
+      c.dispatchEvent(new TouchEvent('touchstart', {
+        bubbles: true, cancelable: true,
+        touches: parTouchList(c, null), targetTouches: parTouchList(c, null),
+        changedTouches: [new Touch({ identifier: id, target: c, clientX: pt.x, clientY: pt.y })]
+      }));
+    } catch (e) {
+      delete parActive[id];
+      fail('入力送信でエラー: ' + e.message);
+      return;
+    }
+    rec.timer = setTimeout(function () { parEnd(id, gen); }, cfg.pressMs);
+  }
+
+  function parHasFlee() {
+    for (var k in parActive) { if (parActive[k].kind === 'flee') return true; }
+    return false;
+  }
+
+  function parTouchList(c, excludeId) {
+    var list = [];
+    for (var k in parActive) {
+      if (excludeId !== null && String(excludeId) === k) continue;
+      var r = parActive[k];
+      list.push(new Touch({ identifier: parseInt(k, 10), target: c, clientX: r.x, clientY: r.y }));
+    }
+    return list;
+  }
+
+  function parEnd(id, gen) {
+    var rec = parActive[id];
+    if (!rec) return;
+    delete parActive[id];
+    try {
+      var rest = parTouchList(rec.canvas, null);
+      rec.canvas.dispatchEvent(new TouchEvent('touchend', {
+        bubbles: true, cancelable: true,
+        touches: rest, targetTouches: rest,
+        changedTouches: [new Touch({ identifier: id, target: rec.canvas, clientX: rec.x, clientY: rec.y })]
+      }));
+    } catch (e) {}
+    if (runStopped(gen)) return;
+    if (rec.kind === 'flee') {
+      fleeCount++;
+    } else {
+      attackCount++; sinceFlee++;
+      if (attackCount % 1000 === 0) logEvent('攻撃 ' + attackCount + ' 回（経過 ' + fmtTime(Date.now() - startedAt) + '）');
+    }
+    updateStatus();
+  }
+
+  // 停止時: 押下中の全指をまとめて解放する
+  function parCleanup() {
+    if (parTimer) { clearTimeout(parTimer); parTimer = null; }
+    var ids = Object.keys(parActive);
+    if (!ids.length) return;
+    var c = parActive[ids[0]].canvas;
+    var changed = [];
+    for (var i = 0; i < ids.length; i++) {
+      var rec = parActive[ids[i]];
+      if (rec.timer) clearTimeout(rec.timer);
+      changed.push(new Touch({ identifier: parseInt(ids[i], 10), target: c, clientX: rec.x, clientY: rec.y }));
+    }
+    parActive = {};
+    try {
+      c.dispatchEvent(new TouchEvent('touchend', {
+        bubbles: true, cancelable: true,
+        touches: [], targetTouches: [], changedTouches: changed
+      }));
+    } catch (e) {}
   }
 
   // 開始直後はゆっくりした「準備タップ」を挟む（実機の癖への対策: 手で数回押してから
@@ -225,34 +379,52 @@
 
   function startRun() {
     if (running) return;
+    if (calibTarget) { setStatus('座標の登録中は開始できません'); return; }
     if (!cfg.atk) { setStatus('先に「こうげき座標」を設定してください'); return; }
+    runGen++;
+    var gen = runGen;
     running = true;
     stopReason = '';
     attackCount = 0; fleeCount = 0; sinceFlee = 0;
     warmupLeft = 6;
     startedAt = Date.now();
-    elapsedTimer = setInterval(updateStatus, 500);
+    elapsedTimer = setInterval(function () { updateStatus(true); }, 500);
+    // ハートビート（ローダーが「実行中は更新を切り替えない」判断に使う。所有者つき）
+    save('kr_heartbeat', Date.now());
+    save('kr_heartbeat_owner', sessionId);
+    hbTimer = setInterval(function () {
+      save('kr_heartbeat', Date.now());
+      save('kr_heartbeat_owner', sessionId);
+    }, 2000);
     logEvent('開始: ' + METHOD_LABEL[cfg.method] + ' 間隔' + cfg.intervalMs + 'ms 押下' + cfg.pressMs + 'ms' +
+      (useParallel() ? ' 同時' + cfg.fingers + '本' : '') +
       ' 逃走' + (cfg.fleeEvery > 0 ? cfg.fleeEvery + '回ごと' : 'なし') +
       ' 制限' + (cfg.limitMin > 0 ? cfg.limitMin + '分' : 'なし'));
     updatePanel();
-    updateStatus();
-    tick();
+    updateStatus(true);
+    if (useParallel()) parCadence(gen);
+    else tick(gen);
   }
 
   function stopRun(reason) {
     var wasRunning = running;
+    runGen++; // 予約済みの全コールバックを無効化する
     if (timer) { clearTimeout(timer); timer = null; }
+    if (fleeTimer) { clearTimeout(fleeTimer); fleeTimer = null; }
     if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+    if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+    releaseInFlight();
+    parCleanup();
     if (running && reason) stopReason = reason;
     running = false;
-    save('kr_heartbeat', 0);
+    // ハートビートは所有者（このタブ）が書いたものだけ消す（別タブの実行を邪魔しない）
+    if (load('kr_heartbeat_owner', '') === sessionId) save('kr_heartbeat', 0);
     if (wasRunning) {
       logEvent('停止: ' + (reason || '手動') + '（経過 ' + fmtTime(Date.now() - startedAt) +
         ' / 攻撃 ' + attackCount + ' / 逃走 ' + fleeCount + '）');
     }
     updatePanel();
-    updateStatus();
+    updateStatus(true);
   }
 
   // ---------- 座標登録 ----------
@@ -266,7 +438,19 @@
       e.preventDefault();
       e.stopPropagation();
       var r = canvas.getBoundingClientRect();
+      if (!r.width || !r.height) {
+        endCalib();
+        updatePanel();
+        setStatus('画面サイズが取得できませんでした');
+        return;
+      }
       var pos = { u: (e.clientX - r.left) / r.width, v: (e.clientY - r.top) / r.height };
+      if (!isFinite(pos.u) || !isFinite(pos.v) || pos.u < 0 || pos.u >= 1 || pos.v < 0 || pos.v >= 1) {
+        endCalib();
+        updatePanel();
+        setStatus('ボタンの範囲内をタップしてください');
+        return;
+      }
       if (target === 'atk') { cfg.atk = pos; save('kr_atk', pos); }
       else { cfg.flee = pos; save('kr_flee', pos); }
       endCalib();
@@ -319,15 +503,18 @@
     return m + ':' + ss;
   }
 
-  function updateStatus() {
+  var lastStatusAt = 0;
+  function updateStatus(force) {
     if (!statusEl) return;
+    var now = Date.now();
+    // 実行中の表示更新は 250ms に1回まで（攻撃ごとの書き換えは端末負荷になるため）
+    if (running && !force && now - lastStatusAt < 250) return;
+    lastStatusAt = now;
     if (running) {
-      // ローダーが「実行中は更新を切り替えない」判断に使うハートビート
-      var nowHb = Date.now();
-      if (nowHb - lastHb > 2000) { lastHb = nowHb; save('kr_heartbeat', nowHb); }
-      statusEl.textContent = '実行中 ' + fmtTime(Date.now() - startedAt) +
+      statusEl.textContent = '実行中 ' + fmtTime(now - startedAt) +
         ' / 攻撃 ' + attackCount + ' / 逃走 ' + fleeCount +
         ' / ' + METHOD_LABEL[cfg.method] + ' ' + cfg.intervalMs + 'ms' +
+        (useParallel() ? ' ' + cfg.fingers + '本同時' : '') +
         (warmupLeft > 0 ? '（準備タップ中）' : '');
     } else if (stopReason) {
       statusEl.textContent = '停止: ' + stopReason + '（攻撃 ' + attackCount + ' / 逃走 ' + fleeCount + '）';
@@ -387,6 +574,8 @@
           '<label>制限 <select id="kr-limit" style="min-height:34px;">' +
             '<option value="5">5分</option><option value="30">30分</option>' +
             '<option value="60">60分</option><option value="0">無制限</option></select></label>' +
+          '<label>同時 <select id="kr-fingers" style="min-height:34px;">' +
+            '<option value="1">1本</option><option value="2">2本</option></select></label>' +
         '</div>' +
         '<div style="display:flex;gap:6px;margin-top:6px;">' +
           '<button id="kr-log-toggle" style="flex:1;min-height:34px;">ログ表示</button>' +
@@ -401,62 +590,83 @@
     startBtn = panel.querySelector('#kr-start');
     stopBtn = panel.querySelector('#kr-stop');
 
-    var body = panel.querySelector('#kr-body');
-    panel.querySelector('#kr-min').addEventListener('click', function () {
-      body.style.display = (body.style.display === 'none') ? '' : 'none';
-      this.textContent = (body.style.display === 'none') ? '＋' : '－';
-    });
-
     startBtn.addEventListener('click', startRun);
-    stopBtn.addEventListener('click', function () { stopRun('手動停止'); });
+    stopBtn.addEventListener('click', function () { stopRun('手動で停止'); });
     panel.querySelector('#kr-cal-atk').addEventListener('click', function () { startCalib('atk'); });
     panel.querySelector('#kr-cal-flee').addEventListener('click', function () { startCalib('flee'); });
+    panel.querySelector('#kr-min').addEventListener('click', function () {
+      var body = panel.querySelector('#kr-body');
+      var hide = body.style.display !== 'none';
+      body.style.display = hide ? 'none' : 'block';
+      this.textContent = hide ? '＋' : '－';
+    });
+
     panel.querySelector('#kr-test').addEventListener('click', function () {
-      if (running) return;
+      if (running) { setStatus('実行中はテストできません'); return; }
+      if (calibTarget) { setStatus('座標の登録中はテストできません'); return; }
+      if (inFlight || Object.keys(parActive).length) { setStatus('押下中です。少し待ってください'); return; }
       if (!cfg.atk) { setStatus('先に「こうげき座標」を設定してください'); return; }
-      dispatchPress(cfg.atk, function (ok) {
-        setStatus(ok ? ('単発テスト送信: ' + METHOD_LABEL[cfg.method] + '（HPバーが減ったか見てください）')
-                     : '単発テスト失敗（上の理由を確認）');
+      dispatchPress(cfg.atk, runGen, function (ok) {
+        setStatus(ok ? '単発テストを送信しました' : '単発テストに失敗しました');
       });
     });
 
     var methodSel = panel.querySelector('#kr-method');
     methodSel.value = cfg.method;
-    methodSel.addEventListener('change', function () { cfg.method = this.value; save('kr_method', cfg.method); logEvent('方式を ' + METHOD_LABEL[cfg.method] + ' に変更'); });
+    methodSel.addEventListener('change', function () {
+      cfg.method = this.value;
+      save('kr_method', cfg.method);
+      logEvent('方式を ' + METHOD_LABEL[cfg.method] + ' に変更');
+    });
 
     var intervalInput = panel.querySelector('#kr-interval');
     var pressInput = panel.querySelector('#kr-press');
 
-    function applyInterval(v, silent) {
+    // 数値入力の扱い: 入力中（'input'）は範囲内の値だけを即反映し、欄の文字は書き戻さない
+    // （書き戻すと「30」と打つ途中の「3」が下限で「5」に化けて設定できなくなる）。
+    // 確定時（'change' と －/＋）にだけ整形して書き戻し、変わったときだけログに残す。
+    function applyInterval(v, mode) {
       if (isNaN(v)) return;
+      if (mode === 'input') {
+        if (v < 0 || v > 1000) return;
+        cfg.intervalMs = v;
+        save('kr_intervalMs', v);
+        return;
+      }
       v = Math.max(0, Math.min(1000, v));
+      var changed = v !== cfg.intervalMs;
       cfg.intervalMs = v;
       intervalInput.value = String(v);
       save('kr_intervalMs', v);
-      if (!silent) { logEvent('間隔を ' + v + 'ms に変更'); setStatus('間隔を ' + v + 'ms に設定しました'); }
+      if (changed) { logEvent('間隔を ' + v + 'ms に変更'); setStatus('間隔を ' + v + 'ms に設定しました'); }
     }
-    function applyPress(v, silent) {
+    function applyPress(v, mode) {
       if (isNaN(v)) return;
+      if (mode === 'input') {
+        if (v < 5 || v > 200) return;
+        cfg.pressMs = v;
+        save('kr_pressMs', v);
+        return;
+      }
       v = Math.max(5, Math.min(200, v));
+      var changed = v !== cfg.pressMs;
       cfg.pressMs = v;
       pressInput.value = String(v);
       save('kr_pressMs', v);
-      if (!silent) { logEvent('押下を ' + v + 'ms に変更'); setStatus('押下を ' + v + 'ms に設定しました'); }
+      if (changed) { logEvent('押下を ' + v + 'ms に変更'); setStatus('押下を ' + v + 'ms に設定しました'); }
     }
 
-    // 打った瞬間に保存する（'change' だけだとフォーカスが外れるまで保存されず、
-    // 実機で「設定できない」ように見えたため 'input' でも保存する）
     intervalInput.value = String(cfg.intervalMs);
-    intervalInput.addEventListener('input', function () { applyInterval(parseInt(this.value, 10), true); });
-    intervalInput.addEventListener('change', function () { applyInterval(parseInt(this.value, 10), false); });
+    intervalInput.addEventListener('input', function () { applyInterval(parseInt(this.value, 10), 'input'); });
+    intervalInput.addEventListener('change', function () { applyInterval(parseInt(this.value, 10), 'set'); });
     pressInput.value = String(cfg.pressMs);
-    pressInput.addEventListener('input', function () { applyPress(parseInt(this.value, 10), true); });
-    pressInput.addEventListener('change', function () { applyPress(parseInt(this.value, 10), false); });
+    pressInput.addEventListener('input', function () { applyPress(parseInt(this.value, 10), 'input'); });
+    pressInput.addEventListener('change', function () { applyPress(parseInt(this.value, 10), 'set'); });
 
-    panel.querySelector('#kr-int-minus').addEventListener('click', function () { applyInterval(cfg.intervalMs - 5, false); });
-    panel.querySelector('#kr-int-plus').addEventListener('click', function () { applyInterval(cfg.intervalMs + 5, false); });
-    panel.querySelector('#kr-press-minus').addEventListener('click', function () { applyPress(cfg.pressMs - 5, false); });
-    panel.querySelector('#kr-press-plus').addEventListener('click', function () { applyPress(cfg.pressMs + 5, false); });
+    panel.querySelector('#kr-int-minus').addEventListener('click', function () { applyInterval(cfg.intervalMs - 5, 'set'); });
+    panel.querySelector('#kr-int-plus').addEventListener('click', function () { applyInterval(cfg.intervalMs + 5, 'set'); });
+    panel.querySelector('#kr-press-minus').addEventListener('click', function () { applyPress(cfg.pressMs - 5, 'set'); });
+    panel.querySelector('#kr-press-plus').addEventListener('click', function () { applyPress(cfg.pressMs + 5, 'set'); });
 
     var fleeSel = panel.querySelector('#kr-flee-every');
     fleeSel.value = String(cfg.fleeEvery);
@@ -465,6 +675,15 @@
     var limitSel = panel.querySelector('#kr-limit');
     limitSel.value = String(cfg.limitMin);
     limitSel.addEventListener('change', function () { cfg.limitMin = parseInt(this.value, 10); save('kr_limitMin', cfg.limitMin); logEvent('制限を ' + (cfg.limitMin > 0 ? cfg.limitMin + '分' : '無制限') + ' に変更'); });
+
+    var fingersSel = panel.querySelector('#kr-fingers');
+    fingersSel.value = String(cfg.fingers);
+    fingersSel.addEventListener('change', function () {
+      cfg.fingers = parseInt(this.value, 10);
+      save('kr_fingers', cfg.fingers);
+      logEvent('同時タップを ' + cfg.fingers + '本に変更');
+      if (cfg.fingers >= 2 && cfg.method !== 'touch') setStatus('同時タップは方式E（タッチ）のときだけ効きます');
+    });
 
     var logEl = panel.querySelector('#kr-log');
     function renderLog() {
@@ -481,6 +700,7 @@
       }
       logEl.textContent = lines.join('\n');
     }
+    logRenderFn = function () { if (logEl.style.display !== 'none') renderLog(); };
     panel.querySelector('#kr-log-toggle').addEventListener('click', function () {
       var show = logEl.style.display === 'none';
       logEl.style.display = show ? 'block' : 'none';
@@ -574,14 +794,17 @@
   document.addEventListener('visibilitychange', function () {
     if (document.hidden && running) stopRun('タブが非表示になりました');
   });
+  window.addEventListener('pagehide', function () {
+    if (running) stopRun('ページが閉じられました');
+  });
 
+  // サイズが変わった瞬間に止める（遅らせると座標がずれたまま押し続けるため）。
+  // マーカーの追随だけを 300ms デバウンスする。
   var resizeTimer = null;
   window.addEventListener('resize', function () {
+    if (running) stopRun('画面サイズが変わりました');
     if (resizeTimer) clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(function () {
-      drawMarkers();
-      if (running) stopRun('画面サイズが変わりました');
-    }, 300);
+    resizeTimer = setTimeout(drawMarkers, 300);
   });
 
   // 実タップ（信頼済みイベント）で即停止。ただしパネル操作は除く。
@@ -596,15 +819,20 @@
   document.addEventListener('touchstart', onTrustedInput, true);
   document.addEventListener('mousedown', onTrustedInput, true);
 
+  // webglcontextlost は、その canvas が現役のときだけ停止理由にする
+  function attachContextLost(c) {
+    c.addEventListener('webglcontextlost', function () {
+      if (c === canvas && running) stopRun('WebGL コンテキストが失われました');
+    });
+  }
+
   // ---------- 起動 ----------
   var bootTimer = setInterval(function () {
     var c = findCanvas();
     if (!c) return;
     clearInterval(bootTimer);
     canvas = c;
-    canvas.addEventListener('webglcontextlost', function () {
-      if (running) stopRun('WebGL コンテキストが失われました');
-    });
+    attachContextLost(canvas);
     markerAtk = makeMarker('rgba(255,60,60,0.85)');
     markerFlee = makeMarker('rgba(60,120,255,0.85)');
     buildPanel();
@@ -616,9 +844,7 @@
       if (now && now !== canvas) {
         if (running) { stopRun('canvas が差し替わりました'); }
         canvas = now;
-        canvas.addEventListener('webglcontextlost', function () {
-          if (running) stopRun('WebGL コンテキストが失われました');
-        });
+        attachContextLost(canvas);
       }
       drawMarkers();
     }, 1000);
