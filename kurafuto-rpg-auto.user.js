@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.5
+// @version      1.0.6
 // @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '1.0.5';
+  var SCRIPT_VERSION = '1.0.6';
 
   // ---------- 設定（GM に保存） ----------
   function load(key, def) {
@@ -67,6 +67,7 @@
   var sinceFlee = 0;
   var warmupLeft = 0;
   var touchSeq = 0;
+  var lastHb = 0;
   var stopReason = '';
   var calibTarget = null; // 'atk' | 'flee' | null
   var overlay = null;
@@ -228,6 +229,7 @@
     if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
     if (running && reason) stopReason = reason;
     running = false;
+    save('kr_heartbeat', 0);
     updatePanel();
     updateStatus();
   }
@@ -298,6 +300,9 @@
   function updateStatus() {
     if (!statusEl) return;
     if (running) {
+      // ローダーが「実行中は更新を切り替えない」判断に使うハートビート
+      var nowHb = Date.now();
+      if (nowHb - lastHb > 2000) { lastHb = nowHb; save('kr_heartbeat', nowHb); }
       statusEl.textContent = '実行中 ' + fmtTime(Date.now() - startedAt) +
         ' / 攻撃 ' + attackCount + ' / 逃走 ' + fleeCount +
         ' / ' + METHOD_LABEL[cfg.method] + ' ' + cfg.intervalMs + 'ms' +
@@ -348,8 +353,12 @@
           '</select>' +
         '</div>' +
         '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">' +
-          '<label>間隔 <input id="kr-interval" type="number" min="0" max="1000" step="5" style="width:62px;min-height:34px;">ms</label>' +
-          '<label>押下 <input id="kr-press" type="number" min="5" max="200" step="5" style="width:62px;min-height:34px;">ms</label>' +
+          '<span>間隔 <button id="kr-int-minus" style="min-width:34px;min-height:34px;">－</button>' +
+          '<input id="kr-interval" type="number" min="0" max="1000" step="5" style="width:56px;min-height:34px;">' +
+          '<button id="kr-int-plus" style="min-width:34px;min-height:34px;">＋</button>ms</span>' +
+          '<span>押下 <button id="kr-press-minus" style="min-width:34px;min-height:34px;">－</button>' +
+          '<input id="kr-press" type="number" min="5" max="200" step="5" style="width:56px;min-height:34px;">' +
+          '<button id="kr-press-plus" style="min-width:34px;min-height:34px;">＋</button>ms</span>' +
           '<label>逃走 <select id="kr-flee-every" style="min-height:34px;">' +
             '<option value="0">しない</option><option value="25">25回ごと</option>' +
             '<option value="60">60回ごと</option><option value="150">150回ごと</option></select></label>' +
@@ -388,24 +397,38 @@
     methodSel.addEventListener('change', function () { cfg.method = this.value; save('kr_method', cfg.method); });
 
     var intervalInput = panel.querySelector('#kr-interval');
-    intervalInput.value = String(cfg.intervalMs);
-    intervalInput.addEventListener('change', function () {
-      var v = parseInt(this.value, 10);
-      if (isNaN(v)) v = 100;
-      v = Math.max(0, Math.min(1000, v));
-      cfg.intervalMs = v; this.value = String(v);
-      save('kr_intervalMs', v);
-    });
-
     var pressInput = panel.querySelector('#kr-press');
-    pressInput.value = String(cfg.pressMs);
-    pressInput.addEventListener('change', function () {
-      var v = parseInt(this.value, 10);
-      if (isNaN(v)) v = 30;
+
+    function applyInterval(v, silent) {
+      if (isNaN(v)) return;
+      v = Math.max(0, Math.min(1000, v));
+      cfg.intervalMs = v;
+      intervalInput.value = String(v);
+      save('kr_intervalMs', v);
+      if (!silent) setStatus('間隔を ' + v + 'ms に設定しました');
+    }
+    function applyPress(v, silent) {
+      if (isNaN(v)) return;
       v = Math.max(5, Math.min(200, v));
-      cfg.pressMs = v; this.value = String(v);
+      cfg.pressMs = v;
+      pressInput.value = String(v);
       save('kr_pressMs', v);
-    });
+      if (!silent) setStatus('押下を ' + v + 'ms に設定しました');
+    }
+
+    // 打った瞬間に保存する（'change' だけだとフォーカスが外れるまで保存されず、
+    // 実機で「設定できない」ように見えたため 'input' でも保存する）
+    intervalInput.value = String(cfg.intervalMs);
+    intervalInput.addEventListener('input', function () { applyInterval(parseInt(this.value, 10), true); });
+    intervalInput.addEventListener('change', function () { applyInterval(parseInt(this.value, 10), false); });
+    pressInput.value = String(cfg.pressMs);
+    pressInput.addEventListener('input', function () { applyPress(parseInt(this.value, 10), true); });
+    pressInput.addEventListener('change', function () { applyPress(parseInt(this.value, 10), false); });
+
+    panel.querySelector('#kr-int-minus').addEventListener('click', function () { applyInterval(cfg.intervalMs - 5, false); });
+    panel.querySelector('#kr-int-plus').addEventListener('click', function () { applyInterval(cfg.intervalMs + 5, false); });
+    panel.querySelector('#kr-press-minus').addEventListener('click', function () { applyPress(cfg.pressMs - 5, false); });
+    panel.querySelector('#kr-press-plus').addEventListener('click', function () { applyPress(cfg.pressMs + 5, false); });
 
     var fleeSel = panel.querySelector('#kr-flee-every');
     fleeSel.value = String(cfg.fleeEvery);
