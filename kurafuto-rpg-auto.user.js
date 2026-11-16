@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.4
+// @version      1.0.5
 // @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '1.0.4';
+  var SCRIPT_VERSION = '1.0.5';
 
   // ---------- 設定（GM に保存） ----------
   function load(key, def) {
@@ -26,7 +26,7 @@
   var cfg = {
     method: load('kr_method', 'mouse'),     // mouse / mouseMove / pointer / click / touch
     intervalMs: load('kr_intervalMs', 200), // クリック間隔(ms)
-    pressMs: 30,                            // 押下→解放の間隔(ms)。60fps の約2フレーム分
+    pressMs: load('kr_pressMs', 30),        // 押下→解放の間隔(ms)。60fps の約2フレーム分
     fleeEvery: load('kr_fleeEvery', 0),     // 0=逃走しない / N=攻撃N回ごとに1回逃走
     limitMin: load('kr_limitMin', 5),       // 0=無制限
     atk: load('kr_atk', null),              // {u, v} canvas 内の相対座標
@@ -65,6 +65,8 @@
   var attackCount = 0;
   var fleeCount = 0;
   var sinceFlee = 0;
+  var warmupLeft = 0;
+  var touchSeq = 0;
   var stopReason = '';
   var calibTarget = null; // 'atk' | 'flee' | null
   var overlay = null;
@@ -135,13 +137,15 @@
         return;
       }
       if (m === 'touch') {
-        var t1 = new Touch({ identifier: 1, target: canvas, clientX: x, clientY: y });
+        touchSeq++;
+        var touchId = touchSeq;
+        var t1 = new Touch({ identifier: touchId, target: canvas, clientX: x, clientY: y });
         canvas.dispatchEvent(new TouchEvent('touchstart', {
           bubbles: true, cancelable: true,
           touches: [t1], targetTouches: [t1], changedTouches: [t1]
         }));
         setTimeout(function () {
-          var t2 = new Touch({ identifier: 1, target: canvas, clientX: x, clientY: y });
+          var t2 = new Touch({ identifier: touchId, target: canvas, clientX: x, clientY: y });
           canvas.dispatchEvent(new TouchEvent('touchend', {
             bubbles: true, cancelable: true,
             touches: [], targetTouches: [], changedTouches: [t2]
@@ -190,12 +194,19 @@
             });
           }, 250);
         } else {
-          timer = setTimeout(tick, cfg.intervalMs);
+          timer = setTimeout(tick, effInterval());
         }
       });
     } catch (e) {
       stopRun('エラー: ' + e.message);
     }
+  }
+
+  // 開始直後はゆっくりした「準備タップ」を挟む（実機の癖への対策: 手で数回押してから
+  // 開始すると安定する現象への当て推量。効かなければ将来外す）。
+  function effInterval() {
+    if (warmupLeft > 0) { warmupLeft--; return Math.max(cfg.intervalMs, 200); }
+    return cfg.intervalMs;
   }
 
   function startRun() {
@@ -204,6 +215,7 @@
     running = true;
     stopReason = '';
     attackCount = 0; fleeCount = 0; sinceFlee = 0;
+    warmupLeft = 6;
     startedAt = Date.now();
     elapsedTimer = setInterval(updateStatus, 500);
     updatePanel();
@@ -288,7 +300,8 @@
     if (running) {
       statusEl.textContent = '実行中 ' + fmtTime(Date.now() - startedAt) +
         ' / 攻撃 ' + attackCount + ' / 逃走 ' + fleeCount +
-        ' / ' + METHOD_LABEL[cfg.method] + ' ' + cfg.intervalMs + 'ms';
+        ' / ' + METHOD_LABEL[cfg.method] + ' ' + cfg.intervalMs + 'ms' +
+        (warmupLeft > 0 ? '（準備タップ中）' : '');
     } else if (stopReason) {
       statusEl.textContent = '停止: ' + stopReason + '（攻撃 ' + attackCount + ' / 逃走 ' + fleeCount + '）';
     } else if (!calibTarget) {
@@ -335,12 +348,8 @@
           '</select>' +
         '</div>' +
         '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">' +
-          '<label>間隔 <select id="kr-interval" style="min-height:34px;">' +
-            '<option value="0">0ms</option><option value="10">10ms</option>' +
-            '<option value="20">20ms</option><option value="30">30ms</option>' +
-            '<option value="50">50ms</option><option value="75">75ms</option>' +
-            '<option value="100">100ms</option><option value="150">150ms</option>' +
-            '<option value="200">200ms</option><option value="300">300ms</option></select></label>' +
+          '<label>間隔 <input id="kr-interval" type="number" min="0" max="1000" step="5" style="width:62px;min-height:34px;">ms</label>' +
+          '<label>押下 <input id="kr-press" type="number" min="5" max="200" step="5" style="width:62px;min-height:34px;">ms</label>' +
           '<label>逃走 <select id="kr-flee-every" style="min-height:34px;">' +
             '<option value="0">しない</option><option value="25">25回ごと</option>' +
             '<option value="60">60回ごと</option><option value="150">150回ごと</option></select></label>' +
@@ -378,9 +387,25 @@
     methodSel.value = cfg.method;
     methodSel.addEventListener('change', function () { cfg.method = this.value; save('kr_method', cfg.method); });
 
-    var intervalSel = panel.querySelector('#kr-interval');
-    intervalSel.value = String(cfg.intervalMs);
-    intervalSel.addEventListener('change', function () { cfg.intervalMs = parseInt(this.value, 10); save('kr_intervalMs', cfg.intervalMs); });
+    var intervalInput = panel.querySelector('#kr-interval');
+    intervalInput.value = String(cfg.intervalMs);
+    intervalInput.addEventListener('change', function () {
+      var v = parseInt(this.value, 10);
+      if (isNaN(v)) v = 100;
+      v = Math.max(0, Math.min(1000, v));
+      cfg.intervalMs = v; this.value = String(v);
+      save('kr_intervalMs', v);
+    });
+
+    var pressInput = panel.querySelector('#kr-press');
+    pressInput.value = String(cfg.pressMs);
+    pressInput.addEventListener('change', function () {
+      var v = parseInt(this.value, 10);
+      if (isNaN(v)) v = 30;
+      v = Math.max(5, Math.min(200, v));
+      cfg.pressMs = v; this.value = String(v);
+      save('kr_pressMs', v);
+    });
 
     var fleeSel = panel.querySelector('#kr-flee-every');
     fleeSel.value = String(cfg.fleeEvery);
