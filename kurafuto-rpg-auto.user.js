@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.11
+// @version      1.0.12
 // @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '1.0.11';
+  var SCRIPT_VERSION = '1.0.12';
 
   // ---------- 設定（GM に保存） ----------
   function load(key, def) {
@@ -85,6 +85,7 @@
   var sinceFlee = 0;
   var warmupLeft = 0;
   var touchSeq = 0;
+  var tapTimes = []; // 実際に押下を開始した時刻の履歴（直近5秒、実効速度の表示用）
   var stopReason = '';
   var calibTarget = null; // 'atk' | 'flee' | null
   var overlay = null;
@@ -152,6 +153,7 @@
     var x = pt.x, y = pt.y;
     var m = cfg.method;
     try {
+      noteTapStart();
       if (m === 'click') {
         c.dispatchEvent(makeMouse('click', x, y, 0));
         if (done) done(true);
@@ -223,6 +225,22 @@
   function fail(msg) {
     if (running) stopRun(msg);
     else setStatus(msg);
+  }
+
+  // 実際に押下を開始した時刻を記録し、直近5秒の実効タップ速度（回/秒）を返す
+  function noteTapStart() {
+    var now = Date.now();
+    tapTimes.push(now);
+    while (tapTimes.length && now - tapTimes[0] > 5000) tapTimes.shift();
+  }
+
+  function tapRate() {
+    var now = Date.now();
+    while (tapTimes.length && now - tapTimes[0] > 5000) tapTimes.shift();
+    if (tapTimes.length < 2) return null;
+    var span = (tapTimes[tapTimes.length - 1] - tapTimes[0]) / 1000;
+    if (span <= 0) return null;
+    return (tapTimes.length - 1) / span;
   }
 
   // ---------- 連打ループ（単指） ----------
@@ -313,6 +331,7 @@
         touches: parTouchList(c, null), targetTouches: parTouchList(c, null),
         changedTouches: [new Touch({ identifier: id, target: c, clientX: pt.x, clientY: pt.y })]
       }));
+      noteTapStart();
     } catch (e) {
       delete parActive[id];
       fail('入力送信でエラー: ' + e.message);
@@ -395,6 +414,7 @@
     running = true;
     stopReason = '';
     attackCount = 0; fleeCount = 0; sinceFlee = 0;
+    tapTimes = [];
     warmupLeft = 6;
     startedAt = Date.now();
     elapsedTimer = setInterval(function () { updateStatus(true); }, 500);
@@ -520,10 +540,12 @@
     if (running && !force && now - lastStatusAt < 250) return;
     lastStatusAt = now;
     if (running) {
+      var rate = tapRate();
       statusEl.textContent = '実行中 ' + fmtTime(now - startedAt) +
         ' / 攻撃 ' + attackCount + ' / 逃走 ' + fleeCount +
         ' / ' + METHOD_LABEL[cfg.method] + ' ' + cfg.intervalMs + 'ms' +
         (useParallel() ? ' ' + cfg.fingers + '本同時' : '') +
+        (rate !== null ? ' / 実効 ' + rate.toFixed(1) + '回/秒' : '') +
         (warmupLeft > 0 ? '（準備タップ中）' : '');
     } else if (stopReason) {
       statusEl.textContent = '停止: ' + stopReason + '（攻撃 ' + attackCount + ' / 逃走 ' + fleeCount + '）';
