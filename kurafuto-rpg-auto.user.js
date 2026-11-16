@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.0
+// @version      1.0.1
 // @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '1.0.0';
+  var SCRIPT_VERSION = '1.0.1';
 
   // ---------- 設定（GM に保存） ----------
   function load(key, def) {
@@ -71,7 +71,7 @@
   // ---------- 入力送信 ----------
   function makeMouse(type, x, y, buttons) {
     return new MouseEvent(type, {
-      bubbles: true, cancelable: true, view: window,
+      bubbles: true, cancelable: true,
       clientX: Math.round(x), clientY: Math.round(y),
       button: 0, buttons: buttons
     });
@@ -105,13 +105,13 @@
       }
       if (m === 'pointer') {
         canvas.dispatchEvent(new PointerEvent('pointerdown', {
-          bubbles: true, cancelable: true, view: window,
+          bubbles: true, cancelable: true,
           clientX: x, clientY: y, button: 0, buttons: 1,
           pointerId: 1, isPrimary: true, pointerType: 'mouse'
         }));
         setTimeout(function () {
           canvas.dispatchEvent(new PointerEvent('pointerup', {
-            bubbles: true, cancelable: true, view: window,
+            bubbles: true, cancelable: true,
             clientX: x, clientY: y, button: 0, buttons: 0,
             pointerId: 1, isPrimary: true, pointerType: 'mouse'
           }));
