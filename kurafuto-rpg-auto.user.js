@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.7
+// @version      1.0.8
 // @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '1.0.7';
+  var SCRIPT_VERSION = '1.0.8';
 
   // ---------- 設定（GM に保存） ----------
   function load(key, def) {
@@ -390,6 +390,7 @@
         '</div>' +
         '<div style="display:flex;gap:6px;margin-top:6px;">' +
           '<button id="kr-log-toggle" style="flex:1;min-height:34px;">ログ表示</button>' +
+          '<button id="kr-probe" style="flex:1;min-height:34px;">データ確認</button>' +
           '<button id="kr-log-clear" style="min-height:34px;">ログ消去</button>' +
         '</div>' +
         '<div id="kr-log" style="display:none;margin-top:6px;max-height:180px;overflow-y:auto;background:rgba(0,0,0,0.35);border-radius:6px;padding:6px;font-size:11px;white-space:pre-wrap;word-break:break-all;"></div>' +
@@ -491,6 +492,80 @@
       renderLog();
       setStatus('ログを消去しました');
     });
+
+    // ---------- データ確認（ゲーム内部データが読めるかの調査） ----------
+    function probeData() {
+      logEvent('データ確認を開始します');
+      try {
+        logEvent('localStorage: ' + localStorage.length + ' 件');
+        for (var i = 0; i < localStorage.length && i < 25; i++) {
+          var k = localStorage.key(i);
+          var v = localStorage.getItem(k) || '';
+          logEvent('LS [' + k + '] = ' + String(v).slice(0, 120));
+        }
+      } catch (e) { logEvent('localStorage 読めません: ' + e.message); }
+      try { logEvent('sessionStorage: ' + sessionStorage.length + ' 件'); } catch (e) {}
+      try { logEvent('cookie: ' + (document.cookie ? document.cookie.slice(0, 160) : '(なし)')); } catch (e) {}
+      try {
+        var pw = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+        var names = ['unityInstance', 'gameInstance', 'Module', 'UnityLoader', 'createUnityInstance'];
+        for (var j = 0; j < names.length; j++) {
+          var nm = names[j];
+          var val = pw[nm];
+          logEvent('global ' + nm + ': ' + (val === undefined ? 'なし' : typeof val));
+          if (val && typeof val === 'object') {
+            try { logEvent('  キー: ' + Object.keys(val).slice(0, 25).join(',')); } catch (e) {}
+          }
+        }
+        var mod = pw.Module || (pw.unityInstance && pw.unityInstance.Module);
+        if (mod) {
+          try { if (mod.HEAPU8) logEvent('Module.HEAPU8: ' + mod.HEAPU8.length + ' バイト'); } catch (e) {}
+        }
+        logEvent('canvas 数: ' + document.querySelectorAll('canvas').length);
+      } catch (e) { logEvent('グローバル確認でエラー: ' + e.message); }
+      try {
+        if (window.indexedDB && indexedDB.databases) {
+          indexedDB.databases().then(function (dbs) {
+            logEvent('IndexedDB: ' + (dbs ? dbs.length : 0) + ' 件');
+            (dbs || []).forEach(function (info) { probeDb(info.name); });
+          }, function (e) { logEvent('IndexedDB 一覧が取れません: ' + e.message); });
+        } else {
+          logEvent('IndexedDB の一覧APIがありません');
+        }
+      } catch (e) { logEvent('IndexedDB 確認でエラー: ' + e.message); }
+      renderLog();
+      setStatus('データ確認の結果をログに出しました');
+    }
+
+    function probeDb(name) {
+      try {
+        var req = indexedDB.open(name);
+        req.onerror = function () { logEvent('DB [' + name + '] 開けません'); renderLog(); };
+        req.onsuccess = function () {
+          var db = req.result;
+          var stores = [];
+          for (var i = 0; i < db.objectStoreNames.length; i++) stores.push(db.objectStoreNames[i]);
+          logEvent('DB [' + name + '] v' + db.version + ' ストア: ' + (stores.join(', ') || '(なし)'));
+          stores.forEach(function (sn) {
+            try {
+              var tx = db.transaction(sn, 'readonly');
+              var st = tx.objectStore(sn);
+              var creq = st.count();
+              creq.onsuccess = function () { logEvent('  [' + sn + '] ' + creq.result + ' 件'); renderLog(); };
+              var kreq = st.getAllKeys(null, 5);
+              kreq.onsuccess = function () {
+                var keys = (kreq.result || []).map(function (x) { return String(x).slice(0, 60); });
+                logEvent('  [' + sn + '] キー例: ' + keys.join(' | '));
+                renderLog();
+              };
+            } catch (e) { logEvent('  [' + sn + '] 読めません: ' + e.message); }
+          });
+          renderLog();
+        };
+      } catch (e) { logEvent('DB [' + name + '] でエラー: ' + e.message); }
+    }
+
+    panel.querySelector('#kr-probe').addEventListener('click', function () { probeData(); });
 
     updatePanel();
   }
