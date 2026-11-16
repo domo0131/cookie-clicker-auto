@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.9
+// @version      1.0.10
 // @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '1.0.9';
+  var SCRIPT_VERSION = '1.0.10';
 
   // ---------- 設定（GM に保存） ----------
   function load(key, def) {
@@ -96,6 +96,7 @@
   // 2本同時タップ用: identifier -> {x, y, kind, canvas, timer}
   var parActive = {};
   var parTimer = null;
+  var parDue = 0; // 2本同時タップの次回開始の目標時刻（締切方式で処理落ちを取り戻す）
 
   function useParallel() { return cfg.fingers >= 2 && cfg.method === 'touch'; }
 
@@ -234,6 +235,7 @@
       if (document.hidden) { stopRun('タブが非表示になりました'); return; }
       if (cfg.limitMin > 0 && Date.now() - startedAt >= cfg.limitMin * 60000) { stopRun('制限時間に到達'); return; }
       if (!cfg.atk) { stopRun('こうげき座標が未設定です'); return; }
+      var t0 = Date.now();
       dispatchPress(cfg.atk, gen, function (ok) {
         if (runStopped(gen) || !ok) return;
         attackCount++; sinceFlee++;
@@ -243,7 +245,11 @@
           sinceFlee = 0;
           fleeTimer = setTimeout(function () { fleeStep(gen); }, 250);
         } else {
-          timer = setTimeout(function () { tick(gen); }, effInterval());
+          // 目標周期（押下＋間隔）から実経過を差し引いて次を予約する。
+          // 敵を倒す瞬間の処理落ちでタイマーが遅れても、遅れた分だけ待ちを
+          // 縮めて実効速度を取り戻す（従来は遅れがそのまま速度低下になった）。
+          var wait = Math.max(0, (cfg.pressMs + effInterval()) - (Date.now() - t0));
+          timer = setTimeout(function () { tick(gen); }, wait);
         }
       });
     } catch (e) {
@@ -281,7 +287,10 @@
     if (document.hidden) { stopRun('タブが非表示になりました'); return; }
     if (cfg.limitMin > 0 && Date.now() - startedAt >= cfg.limitMin * 60000) { stopRun('制限時間に到達'); return; }
     if (Object.keys(parActive).length < cfg.fingers) parPress(gen);
-    parTimer = setTimeout(function () { parCadence(gen); }, parStagger());
+    parDue += parStagger();
+    var delay = parDue - Date.now();
+    if (delay < -1000) { parDue = Date.now(); delay = parStagger(); } // 大きく遅れたら現在時刻に合わせ直す
+    parTimer = setTimeout(function () { parCadence(gen); }, Math.max(0, delay));
   }
 
   function parPress(gen) {
@@ -402,7 +411,7 @@
       ' 制限' + (cfg.limitMin > 0 ? cfg.limitMin + '分' : 'なし'));
     updatePanel();
     updateStatus(true);
-    if (useParallel()) parCadence(gen);
+    if (useParallel()) { parDue = Date.now(); parCadence(gen); }
     else tick(gen);
   }
 
@@ -838,15 +847,21 @@
     buildPanel();
     logEvent('起動 v' + SCRIPT_VERSION);
     drawMarkers();
-    // canvas の差し替え監視とマーカー追随
+    // canvas の差し替え監視とマーカー追随（矩形が変わったときだけ再描画し、負荷を下げる）
+    var lastRectKey = '';
     setInterval(function () {
       var now = findCanvas();
       if (now && now !== canvas) {
         if (running) { stopRun('canvas が差し替わりました'); }
         canvas = now;
         attachContextLost(canvas);
+        lastRectKey = '';
       }
-      drawMarkers();
+      if (canvas) {
+        var r = canvas.getBoundingClientRect();
+        var key = r.left + ',' + r.top + ',' + r.width + ',' + r.height;
+        if (key !== lastRectKey) { lastRectKey = key; drawMarkers(); }
+      }
     }, 1000);
   }, 500);
 })();
