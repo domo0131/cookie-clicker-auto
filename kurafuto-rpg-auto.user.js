@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.6
+// @version      1.0.7
 // @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '1.0.6';
+  var SCRIPT_VERSION = '1.0.7';
 
   // ---------- 設定（GM に保存） ----------
   function load(key, def) {
@@ -22,6 +22,18 @@
     } catch (e) { return def; }
   }
   function save(key, val) { try { GM_setValue(key, val); } catch (e) {} }
+
+  // ---------- 行動ログ（GM に最新200件を保持） ----------
+  var LOG_KEY = 'kr_log';
+  function logEvent(msg) {
+    try {
+      var arr = GM_getValue(LOG_KEY, []);
+      if (!Array.isArray(arr)) arr = [];
+      arr.push({ t: Date.now(), m: String(msg) });
+      while (arr.length > 200) arr.shift();
+      GM_setValue(LOG_KEY, arr);
+    } catch (e) {}
+  }
 
   var cfg = {
     method: load('kr_method', 'mouse'),     // mouse / mouseMove / pointer / click / touch
@@ -183,6 +195,7 @@
       dispatchPress(cfg.atk, function (ok) {
         if (!running || !ok) return;
         attackCount++; sinceFlee++;
+        if (attackCount % 1000 === 0) logEvent('攻撃 ' + attackCount + ' 回（経過 ' + fmtTime(Date.now() - startedAt) + '）');
         updateStatus();
         if (cfg.fleeEvery > 0 && cfg.flee && sinceFlee >= cfg.fleeEvery) {
           sinceFlee = 0;
@@ -219,17 +232,25 @@
     warmupLeft = 6;
     startedAt = Date.now();
     elapsedTimer = setInterval(updateStatus, 500);
+    logEvent('開始: ' + METHOD_LABEL[cfg.method] + ' 間隔' + cfg.intervalMs + 'ms 押下' + cfg.pressMs + 'ms' +
+      ' 逃走' + (cfg.fleeEvery > 0 ? cfg.fleeEvery + '回ごと' : 'なし') +
+      ' 制限' + (cfg.limitMin > 0 ? cfg.limitMin + '分' : 'なし'));
     updatePanel();
     updateStatus();
     tick();
   }
 
   function stopRun(reason) {
+    var wasRunning = running;
     if (timer) { clearTimeout(timer); timer = null; }
     if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
     if (running && reason) stopReason = reason;
     running = false;
     save('kr_heartbeat', 0);
+    if (wasRunning) {
+      logEvent('停止: ' + (reason || '手動') + '（経過 ' + fmtTime(Date.now() - startedAt) +
+        ' / 攻撃 ' + attackCount + ' / 逃走 ' + fleeCount + '）');
+    }
     updatePanel();
     updateStatus();
   }
@@ -251,6 +272,7 @@
       endCalib();
       drawMarkers();
       updatePanel();
+      logEvent((target === 'atk' ? 'こうげき' : 'にげる') + ' の座標を登録');
       setStatus((target === 'atk' ? 'こうげき' : 'にげる') + ' の座標を登録しました');
     }, { once: true });
     document.body.appendChild(overlay);
@@ -366,6 +388,11 @@
             '<option value="5">5分</option><option value="30">30分</option>' +
             '<option value="60">60分</option><option value="0">無制限</option></select></label>' +
         '</div>' +
+        '<div style="display:flex;gap:6px;margin-top:6px;">' +
+          '<button id="kr-log-toggle" style="flex:1;min-height:34px;">ログ表示</button>' +
+          '<button id="kr-log-clear" style="min-height:34px;">ログ消去</button>' +
+        '</div>' +
+        '<div id="kr-log" style="display:none;margin-top:6px;max-height:180px;overflow-y:auto;background:rgba(0,0,0,0.35);border-radius:6px;padding:6px;font-size:11px;white-space:pre-wrap;word-break:break-all;"></div>' +
       '</div>';
     document.body.appendChild(panel);
 
@@ -394,7 +421,7 @@
 
     var methodSel = panel.querySelector('#kr-method');
     methodSel.value = cfg.method;
-    methodSel.addEventListener('change', function () { cfg.method = this.value; save('kr_method', cfg.method); });
+    methodSel.addEventListener('change', function () { cfg.method = this.value; save('kr_method', cfg.method); logEvent('方式を ' + METHOD_LABEL[cfg.method] + ' に変更'); });
 
     var intervalInput = panel.querySelector('#kr-interval');
     var pressInput = panel.querySelector('#kr-press');
@@ -405,7 +432,7 @@
       cfg.intervalMs = v;
       intervalInput.value = String(v);
       save('kr_intervalMs', v);
-      if (!silent) setStatus('間隔を ' + v + 'ms に設定しました');
+      if (!silent) { logEvent('間隔を ' + v + 'ms に変更'); setStatus('間隔を ' + v + 'ms に設定しました'); }
     }
     function applyPress(v, silent) {
       if (isNaN(v)) return;
@@ -413,7 +440,7 @@
       cfg.pressMs = v;
       pressInput.value = String(v);
       save('kr_pressMs', v);
-      if (!silent) setStatus('押下を ' + v + 'ms に設定しました');
+      if (!silent) { logEvent('押下を ' + v + 'ms に変更'); setStatus('押下を ' + v + 'ms に設定しました'); }
     }
 
     // 打った瞬間に保存する（'change' だけだとフォーカスが外れるまで保存されず、
@@ -432,11 +459,38 @@
 
     var fleeSel = panel.querySelector('#kr-flee-every');
     fleeSel.value = String(cfg.fleeEvery);
-    fleeSel.addEventListener('change', function () { cfg.fleeEvery = parseInt(this.value, 10); save('kr_fleeEvery', cfg.fleeEvery); });
+    fleeSel.addEventListener('change', function () { cfg.fleeEvery = parseInt(this.value, 10); save('kr_fleeEvery', cfg.fleeEvery); logEvent('逃走設定を ' + (cfg.fleeEvery > 0 ? cfg.fleeEvery + '回ごと' : 'しない') + ' に変更'); });
 
     var limitSel = panel.querySelector('#kr-limit');
     limitSel.value = String(cfg.limitMin);
-    limitSel.addEventListener('change', function () { cfg.limitMin = parseInt(this.value, 10); save('kr_limitMin', cfg.limitMin); });
+    limitSel.addEventListener('change', function () { cfg.limitMin = parseInt(this.value, 10); save('kr_limitMin', cfg.limitMin); logEvent('制限を ' + (cfg.limitMin > 0 ? cfg.limitMin + '分' : '無制限') + ' に変更'); });
+
+    var logEl = panel.querySelector('#kr-log');
+    function renderLog() {
+      var arr = [];
+      try { arr = GM_getValue(LOG_KEY, []); } catch (e) {}
+      if (!Array.isArray(arr) || arr.length === 0) { logEl.textContent = '（ログはまだありません）'; return; }
+      var lines = [];
+      for (var i = arr.length - 1; i >= 0; i--) {
+        var d = new Date(arr[i].t);
+        var hh = ('0' + d.getHours()).slice(-2);
+        var mm = ('0' + d.getMinutes()).slice(-2);
+        var ss = ('0' + d.getSeconds()).slice(-2);
+        lines.push(hh + ':' + mm + ':' + ss + ' ' + arr[i].m);
+      }
+      logEl.textContent = lines.join('\n');
+    }
+    panel.querySelector('#kr-log-toggle').addEventListener('click', function () {
+      var show = logEl.style.display === 'none';
+      logEl.style.display = show ? 'block' : 'none';
+      this.textContent = show ? 'ログを隠す' : 'ログ表示';
+      if (show) renderLog();
+    });
+    panel.querySelector('#kr-log-clear').addEventListener('click', function () {
+      try { GM_setValue(LOG_KEY, []); } catch (e) {}
+      renderLog();
+      setStatus('ログを消去しました');
+    });
 
     updatePanel();
   }
@@ -479,6 +533,7 @@
     markerAtk = makeMarker('rgba(255,60,60,0.85)');
     markerFlee = makeMarker('rgba(60,120,255,0.85)');
     buildPanel();
+    logEvent('起動 v' + SCRIPT_VERSION);
     drawMarkers();
     // canvas の差し替え監視とマーカー追随
     setInterval(function () {
