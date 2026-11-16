@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.1
+// @version      1.0.2
 // @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '1.0.1';
+  var SCRIPT_VERSION = '1.0.2';
 
   // ---------- 設定（GM に保存） ----------
   function load(key, def) {
@@ -390,7 +390,10 @@
   });
 
   // 実タップ（信頼済みイベント）で即停止。ただしパネル操作は除く。
+  // スクリプト自身が出す合成イベントは isTrusted=false なので必ず除外する
+  // （v1.0.1 まではこの判定がなく、自分のタッチイベントに反応して即停止していた）。
   function onTrustedInput(e) {
+    if (!e.isTrusted) return;
     if (!running) return;
     if (panel && panel.contains(e.target)) return;
     stopRun('手動タップを検知しました');
