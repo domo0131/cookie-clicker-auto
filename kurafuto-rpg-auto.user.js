@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         くらふとRPG オート（そうげん連打）
 // @namespace    muse.kurafuto-rpg
-// @version      1.0.3
+// @version      1.0.4
 // @description  unityroom「くらふとRPG」の「こうげき」ボタンを自動連打します。座標は実タップで登録。開始・停止は手動です。
 // @match        https://80866.play.unityroom.com/*
 // @grant        GM_setValue
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '1.0.3';
+  var SCRIPT_VERSION = '1.0.4';
 
   // ---------- 設定（GM に保存） ----------
   function load(key, def) {
@@ -26,7 +26,7 @@
   var cfg = {
     method: load('kr_method', 'mouse'),     // mouse / mouseMove / pointer / click / touch
     intervalMs: load('kr_intervalMs', 200), // クリック間隔(ms)
-    pressMs: 50,                            // 押下→解放の間隔(ms)
+    pressMs: 30,                            // 押下→解放の間隔(ms)。60fps の約2フレーム分
     fleeEvery: load('kr_fleeEvery', 0),     // 0=逃走しない / N=攻撃N回ごとに1回逃走
     limitMin: load('kr_limitMin', 5),       // 0=無制限
     atk: load('kr_atk', null),              // {u, v} canvas 内の相対座標
@@ -38,6 +38,14 @@
     cfg.intervalMs = 100;
     save('kr_intervalMs', 100);
     save('kr_fast103', true);
+  }
+
+  // v1.0.4 初回のみ: ユーザー指示「もっと短く」を受け、間隔を 20ms に設定する
+  // （押下 30ms + 間隔 20ms = 1タップ 50ms、毎秒約20回）
+  if (!load('kr_fast104', false)) {
+    cfg.intervalMs = 20;
+    save('kr_intervalMs', 20);
+    save('kr_fast104', true);
   }
 
   var METHOD_LABEL = {
@@ -328,6 +336,8 @@
         '</div>' +
         '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">' +
           '<label>間隔 <select id="kr-interval" style="min-height:34px;">' +
+            '<option value="0">0ms</option><option value="10">10ms</option>' +
+            '<option value="20">20ms</option><option value="30">30ms</option>' +
             '<option value="50">50ms</option><option value="75">75ms</option>' +
             '<option value="100">100ms</option><option value="150">150ms</option>' +
             '<option value="200">200ms</option><option value="300">300ms</option></select></label>' +
