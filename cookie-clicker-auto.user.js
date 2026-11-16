@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cookie Clicker 自動購入（Galaxy Tab専用機用）
 // @namespace    muse.cookieclicker
-// @version      2.3.47
+// @version      2.3.48
 // @downloadURL  https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @updateURL    https://raw.githubusercontent.com/domo0131/cookie-clicker-auto/main/cookie-clicker-auto.user.js
 // @description  回収期間（価格÷実CpS増）順の自動購入、大クッキーの自動クリック、黄金クッキーの自動取得（ホロボア配置時は停止）、セーブのファイル書き出し、状態の定期送信（Googleドライブ経由でMuse側のスペースへ反映）を行うユーザースクリプト。
@@ -38,7 +38,7 @@
   };
   /* ====================================================================== */
 
-  var SCRIPT_VERSION = '2.3.47'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
+  var SCRIPT_VERSION = '2.3.48'; // ヘッダーの @version と必ず揃えること（状態送信に含める）
 
   // 絶対に自動購入しないアップグレード（名前の部分一致、大文字小文字は区別しない）
   var BLOCKED_UPGRADE_WORDS = [
@@ -3067,7 +3067,18 @@ function fmt(n) {
         // 購入リスト再生の進み具合（v2.3.41）
         replay: state.replayInfo ? { idx: state.replayInfo.idx, total: state.replayInfo.total, label: state.replayInfo.label } : null,
         // 周回開始スプリントの状態（v2.3.47）
-        sprint: state.sprintInfo ? { phase: state.sprintInfo.phase, label: state.sprintInfo.label } : null
+        sprint: state.sprintInfo ? { phase: state.sprintInfo.phase, label: state.sprintInfo.label } : null,
+        // 周回開始スプリントの結果（v2.3.48）: sprint は実行中の瞬間しか入らないため、
+        // 永続化済みの結果を毎回載せて後から判定できるようにする（読み取りのみ。状態は変えない）
+        sprintLast: (function () {
+          try {
+            var ss = gmGet('ccauto_sprint', null);
+            if (ss && typeof ss.run === 'number') {
+              return { run: ss.run, done: ss.done || '', bought: ss.bought || 0, startedAt: ss.startedAt || 0 };
+            }
+          } catch (e) { /* ignore */ }
+          return null;
+        })()
       };
     } catch (e) { /* ignore */ }
     // 画面ズームの診断（v2.3.44）: 主要要素の矩形とビューポート寸法を載せ、
